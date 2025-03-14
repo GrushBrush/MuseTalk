@@ -1,6 +1,16 @@
+import ffmpeg
 import argparse
 import os
+import pyaudio
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+import threading
+import queue
 from omegaconf import OmegaConf
+import soundfile as sf
+import wave
+import subprocess
 import numpy as np
 import cv2
 import torch
@@ -22,12 +32,125 @@ import queue
 import time
 
 # load model weights
-audio_processor, vae, unet, pe = loadz_all_model()
+audio_processor, vae, unet, pe = load_all_model()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 timesteps = torch.tensor([0], device=device)
 pe = pe.half()
 vae.vae = vae.vae.half()
 unet.model = unet.model.half()
+
+class GStreamerAudio:
+    """ 使用 GStreamer 进行音频推流 """
+
+    def __init__(self):
+        Gst.init(None)
+
+        # 创建 GStreamer 管道
+        self.pipeline = Gst.parse_launch(
+            "appsrc name=audio_source format=time is-live=true "
+            "caps=audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved ! "
+            "queue ! audioconvert ! queue ! audioresample ! "
+            "queue ! opusenc ! queue ! rtpopuspay ! "
+            "udpsink host=127.0.0.1 port=5001 sync=false"
+        )
+
+        self.appsrc = self.pipeline.get_by_name("audio_source")
+        self.appsrc.set_property("blocksize", 65536)  # 增加 blocksize，避免数据阻塞
+        self.appsrc.set_property("format", Gst.Format.TIME)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def send_audio(self, audio_data):
+        """ 一次性发送完整的 PCM 音频数据到 GStreamer """
+        buffer = Gst.Buffer.new_allocate(None, len(audio_data.tobytes()), None)
+        buffer.fill(0, audio_data.tobytes())
+        self.appsrc.emit("push-buffer", buffer)
+        print(f"✅ 已推送完整音频，共 {len(audio_data)} samples")
+
+    def stop(self):
+        """ 关闭音频推流 """
+        self.pipeline.set_state(Gst.State.NULL)
+        print("✅ GStreamer 音频推流已关闭")
+
+class FFmpegAudioReader:
+    """ 使用 FFmpeg 读取整个音频文件，并转换为 PCM """
+
+    def __init__(self, audio_file):
+        self.audio_file = audio_file
+        probe = ffmpeg.probe(audio_file)
+        self.sample_rate = int(probe['streams'][0]['sample_rate'])
+        self.channels = int(probe['streams'][0]['channels'])
+
+    def read_full_audio(self):
+        """ 使用 FFmpeg 读取整个音频文件 """
+        process = subprocess.Popen(
+            ["ffmpeg", "-i", self.audio_file, "-f", "s16le", "-ac", "2", "-ar", "48000", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        raw_data = process.stdout.read()
+        process.stdout.close()
+        process.wait()
+
+        if not raw_data:
+            print("❌ 读取音频文件失败！")
+            return None
+
+        audio_data = np.frombuffer(raw_data, dtype=np.int16).reshape(-1, 2)
+        print(f"✅ 读取完整音频，共 {len(audio_data)} samples")
+        return audio_data
+    
+def split_audio(audio_data, num_chunks):
+    """ 将音频数据分割成 num_chunks 份 """
+    if num_chunks <= 1:
+        return [audio_data]
+
+    chunk_size = len(audio_data) // num_chunks
+    chunks = [audio_data[i * chunk_size: (i + 1) * chunk_size] for i in range(num_chunks)]
+
+    # 如果有剩余样本，加到最后一个 chunk
+    remainder = len(audio_data) % num_chunks
+    if remainder > 0:
+        chunks[-1] = np.vstack((chunks[-1], audio_data[-remainder:]))
+
+    print(f"✅ 音频已分割为 {num_chunks} 份，每份约 {chunk_size} samples")
+    return chunks
+
+class GStreamerPipeline:
+    def __init__(self, width=640, height=480, fps=25, host="127.0.0.1", port=5000):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.host = host
+        self.port = port
+
+        # 🎬 GStreamer 推流管道
+        self.GSTREAMER_PIPELINE = (
+            "appsrc ! videoconvert ! video/x-raw ! "
+            "queue ! x264enc bitrate=8000 tune=zerolatency ! "
+            "rtph264pay ! udpsink host=127.0.0.1 port=5000"
+        )
+
+
+        # 使用 OpenCV 初始化 GStreamer 视频写入
+        self.video_writer = cv2.VideoWriter(self.GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER, 0, 25, (640, 480), True)
+
+        if not self.video_writer.isOpened():
+            raise RuntimeError("❌ GStreamer 推流初始化失败！请检查 GStreamer 是否安装")
+
+    def send_frame(self, frame):
+        """ 发送一帧到 GStreamer """
+        if frame is None:
+            return
+
+        frame = cv2.resize(frame, (self.width, self.height))  # 确保帧大小匹配
+        frame = frame.astype(np.uint8)  # 转换为 uint8 格式
+        self.video_writer.write(frame)  # 推流
+
+    def stop(self):
+        """ 关闭 GStreamer 推流 """
+        self.video_writer.release()
+
+
 
 def video2imgs(vid_path, save_path, ext = '.png',cut_frame = 10000000):
     cap = cv2.VideoCapture(vid_path)
@@ -217,7 +340,7 @@ class Avatar:
             if skip_save_images is False:
                 cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png",combine_frame)
             self.idx = self.idx + 1
-
+    
     def inference(self, 
                   audio_path, 
                   out_vid_name, 
@@ -225,65 +348,67 @@ class Avatar:
                   skip_save_images):
         os.makedirs(self.avatar_path+'/tmp',exist_ok =True)   
         print("start inference")
+
+        gst_pipeline = GStreamerPipeline(width=640, height=480, fps=fps, host="127.0.0.1", port=5000)
+        audio_sender = GStreamerAudio()
         ############################################## extract audio feature ##############################################
         start_time = time.time()
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature,fps=fps)
-        print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
-        ############################################## inference batch by batch ##############################################
-        video_num = len(whisper_chunks)   
-        res_frame_queue = queue.Queue()
-        self.idx = 0
-        # # Create a sub-thread and start it
-        process_thread = threading.Thread(target=self.process_frames, args=(res_frame_queue, video_num, skip_save_images))
-        process_thread.start()
 
-        gen = datagen(whisper_chunks,
-                      self.input_latent_list_cycle, 
-                      self.batch_size)
-        start_time = time.time()
-        res_frame_list = []
-        
-        for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/self.batch_size)))):
+        total_iters = int(np.ceil(float(len(whisper_chunks)) / self.batch_size))
+        audio_reader = FFmpegAudioReader(audio_path)
+        audio_data = audio_reader.read_full_audio()
+        audio_chunks = split_audio(audio_data, total_iters)
+        # for i, chunk in enumerate(audio_chunks):
+        #     print(f"🎧 播放第 {i+1}/{len(audio_chunks)} 个音频片段")
+        #     play_audio_chunk(chunk, original_sample_rate)
+        # print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
+
+        ############################################## inference batch by batch ##############################################
+        video_num = len(whisper_chunks)
+        gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+    
+        frame_count = 0
+        start_time = time.time()  # 记录第一帧推理开始时间
+
+        for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size)))):
+            # 处理音频特征
             audio_feature_batch = torch.from_numpy(whisper_batch)
-            audio_feature_batch = audio_feature_batch.to(device=unet.device,
-                                                         dtype=unet.model.dtype)
+            audio_feature_batch = audio_feature_batch.to(device=unet.device, dtype=unet.model.dtype)
             audio_feature_batch = pe(audio_feature_batch)
+
+            # 处理 `latent_batch`
             latent_batch = latent_batch.to(dtype=unet.model.dtype)
 
-            pred_latents = unet.model(latent_batch, 
-                                      timesteps, 
-                                      encoder_hidden_states=audio_feature_batch).sample
+            # 运行 UNet 生成嘴型动画
+            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
             recon = vae.decode_latents(pred_latents)
-            for res_frame in recon:
-                res_frame_queue.put(res_frame)
-        # Close the queue and sub-thread after all tasks are completed
-        process_thread.join()
+
+            audio_sender.send_audio(audio_chunks[i])
+            # 逐帧推送到 GStreamer
+            for j, res_frame in enumerate(recon):
+                frame_count += 1
+                print("✅ 正在推送视频帧...")
+                gst_pipeline.send_frame(res_frame)  # **顺序推送**
+                # 计算 FPS
+                # elapsed_time = time.time() - start_time
+                # if elapsed_time > 0:
+                #     fps_estimate = frame_count / elapsed_time
+                #     print(f"当前直播帧率: {fps_estimate:.2f} FPS", end='\r')
+
+        ##############################################
+        # Step 4: 结束后计算最终 FPS
+        ##############################################
+        total_elapsed_time = time.time() - start_time
+        print(f"\nelapsed_time: {total_elapsed_time:.2f} s")
+        print(f"\nframe_count: {frame_count:.2f} s")
+        avg_fps = frame_count / total_elapsed_time if total_elapsed_time > 0 else 0
+        print(f"\n最终计算得到的平均帧率: {avg_fps:.2f} FPS")
+        gst_pipeline.stop()
+        audio_sender.stop()
         
-        if args.skip_save_images is True:
-            print('Total process time of {} frames without saving images = {}s'.format(
-                        video_num,
-                        time.time()-start_time))
-        else:
-            print('Total process time of {} frames including saving images = {}s'.format(
-                        video_num,
-                        time.time()-start_time))
-
-        if out_vid_name is not None and args.skip_save_images is False: 
-            # optional
-            cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {self.avatar_path}/tmp/%08d.png -vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {self.avatar_path}/temp.mp4"
-            print(cmd_img2video)
-            os.system(cmd_img2video)
-
-            output_vid = os.path.join(self.video_out_path, out_vid_name+".mp4") # on
-            cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {self.avatar_path}/temp.mp4 {output_vid}"
-            print(cmd_combine_audio)
-            os.system(cmd_combine_audio)
-
-            os.remove(f"{self.avatar_path}/temp.mp4")
-            shutil.rmtree(f"{self.avatar_path}/tmp")
-            print(f"result is save to {output_vid}")
-        print("\n")
+     
        
 
 if __name__ == "__main__":

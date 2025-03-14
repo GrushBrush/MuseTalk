@@ -92,7 +92,12 @@ def get_image_blending(image,face,face_box,mask_array,crop_box):
     face_large = copy.deepcopy(body[y_s:y_e, x_s:x_e])
     face_large[y-y_s:y1-y_s, x-x_s:x1-x_s]=face
 
-    mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
+    # mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
+    if len(mask_array.shape) == 3 and mask_array.shape[2] in [3, 4]:
+        mask_image = cv2.cvtColor(mask_array, cv2.COLOR_BGR2GRAY)
+    else:
+        mask_image = mask_array  # Already grayscale
+
     mask_image = (mask_image/255).astype(np.float32)
 
     body[y_s:y_e, x_s:x_e] = cv2.blendLinear(face_large,body[y_s:y_e, x_s:x_e],mask_image,1-mask_image)
