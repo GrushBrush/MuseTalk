@@ -359,6 +359,21 @@ class Avatar:
             if not skip_save_images:
                 cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", combine_frame)
             self.idx = self.idx + 1
+
+    def process_single_frame(self, res_frame):
+        bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
+        ori_frame = copy.deepcopy(self.frame_list_cycle[self.idx % len(self.frame_list_cycle)])
+        x1, y1, x2, y2 = bbox
+        try:
+            resized_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+        except Exception as e:
+            print("Error resizing frame:", e)
+            return None
+        mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
+        mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
+        combine_frame = get_image_blending(ori_frame, resized_frame, bbox, mask, mask_crop_box)
+        self.idx += 1
+        return combine_frame
     
     def inference(self, audio_path, out_vid_name, fps, skip_save_images):
         os.makedirs(self.avatar_path + '/tmp', exist_ok=True)   
@@ -411,7 +426,10 @@ class Avatar:
             for j, res_frame in enumerate(recon):
                 frame_count += 1
                 print("✅ Pushing video frame...")
-                gst_pipeline.send_frame(res_frame)
+                processed_frame = self.process_single_frame(res_frame)
+                if processed_frame is None:
+                    continue
+                gst_pipeline.send_frame(processed_frame)
             print(f"⏱️ Streaming took: {time.time() - start:.4f} seconds")
         ##############################################
         # Step 4: After finishing, calculate final FPS
@@ -467,4 +485,5 @@ if __name__ == "__main__":
                              audio_num, 
                              args.fps,
                              args.skip_save_images)
+
 
