@@ -8,6 +8,8 @@ models
 results/
 data/audio/*.wav
 data/video/*.mp4
+data/video/*.mov
+data/video/ma/*.mp4
 avatars.zip
 avatars/
 avator_1_skipImage.zip
@@ -18,3 +20,4 @@ ffmpeg-7.0.2-amd64-static/
 ffmpeg-release-amd64-static.tar.xz
 musetalk.zip
 scripts.zip
+venv_PhotonSync/
