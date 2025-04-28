@@ -218,7 +218,7 @@ class GStreamerPipeline:
     "queue ! videoconvert ! video/x-raw,format=NV12 ! "
     "queue ! cudaupload ! "
     # --- Using your old working encoder parameters ---
-    "nvh265enc bitrate=8000000 bframes=0 preset=p1 gop-size=3 ! " # bitrate=20000 kbps -> 20,000,000 bps
+    "nvh265enc bitrate=8000000 bframes=0 preset=default gop-size=25 ! " 
     # --- End using old parameters ---
     "h265parse ! " # Keep h265parse, it's generally good practice
     "rtph265pay config-interval=1 ! "
@@ -307,16 +307,16 @@ class GStreamerAudio:
         self.process = None # Initialize
 
         pipeline_str = (
-            "fdsrc fd=0 ! "
-            "audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved ! "
-            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=3000000000 ! " # Increase queue size (3s)
-            "audioconvert ! "
-            "audioresample ! "
-            "queue ! "
-            "opusenc bitrate=64000 complexity=4 frame-size=20 ! " # Example: 64kbps, lower complexity, 20ms frames
-            "rtpopuspay pt=97 ! "
-            f"udpsink host={self.host} port={self.port} sync=false async=false"
-        )
+    "fdsrc fd=0 do-timestamp=true ! "
+    "audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved ! "
+    # "queue name=q_in ! " # Removed
+    # "audioconvert ! " # Removed
+    # "audioresample ! " # Removed
+    # "queue name=q_before_enc ! " # Removed
+    "opusenc name=enc bitrate=64000 complexity=4 frame-size=20 ! "
+    "rtpopuspay name=pay pt=97 ! "
+    f"udpsink host={self.host} port={self.port} sync=false async=false"
+)
         print("Starting GStreamer audio pipeline...")
         try:
             self.process = subprocess.Popen(
@@ -879,18 +879,25 @@ class Avatar:
     # ========================================================================
     # === PARALLELIZED process_frames ========================================
     # ========================================================================
+    # ========================================================================
+    # === PARALLELIZED process_frames (WITH TIMING LOGS) =====================
+    # ========================================================================
     def process_frames(self, res_frame_queue, video_len, gst_video_pipeline, gst_audio_pipeline, skip_save_images, debug=False):
-        # (Keep the process_frames method code from the previous correct response - no changes needed here)
         print(f"Target video length (number of batches/chunks): {video_len}")
         num_workers = max(1, os.cpu_count() - 2)
         print(f"--- Starting process_frames with {num_workers} workers ---")
 
         if not hasattr(self, 'coord_list_cycle') or not self.coord_list_cycle or len(self.coord_list_cycle) == 0:
-             print("Error: Avatar reference data not loaded or empty before process_frames.")
-             return
+            print("Error: Avatar reference data not loaded or empty before process_frames.")
+            return
 
         batch_counter = 0
         total_frames_sent = 0
+
+        # --- ADDED: Initialization for timing diagnostics ---
+        last_audio_send_time = None
+        time_diffs = []
+        # --- END ADDED ---
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             while True:
@@ -915,16 +922,17 @@ class Avatar:
                 num_frames_in_batch = len(frames)
                 args_list = [(self, i, current_loop_start_idx, frame, gst_video_pipeline.width, gst_video_pipeline.height) for i, frame in enumerate(frames)]
                 results_with_indices = []
-                try: results_with_indices = list(executor.map(process_single_frame_parallel, args_list))
+                try:
+                     results_with_indices = list(executor.map(process_single_frame_parallel, args_list))
                 except Exception as e_map: print(f"Error during executor.map batch {batch_counter}: {e_map}"); batch_counter += 1; self.idx += num_frames_in_batch; continue
 
                 prepared_frames_dict = {}
                 successful_frames_in_batch = 0
                 for result_tuple in results_with_indices:
-                     if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
-                          i, result_frame = result_tuple
-                          if result_frame is not None: prepared_frames_dict[i] = result_frame; successful_frames_in_batch += 1
-                     else: print(f"Warning: Worker returned unexpected result format: {result_tuple}")
+                    if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                        i, result_frame = result_tuple
+                        if result_frame is not None: prepared_frames_dict[i] = result_frame; successful_frames_in_batch += 1
+                    else: print(f"Warning: Worker returned unexpected result format: {result_tuple}")
 
                 prepared_frames = [prepared_frames_dict[i] for i in range(num_frames_in_batch) if i in prepared_frames_dict]
 
@@ -933,27 +941,56 @@ class Avatar:
                     video_send_success = True
                     try:
                         for frame in prepared_frames:
-                             if gst_video_pipeline.send_frame(frame): frames_actually_sent_this_batch += 1
-                             else: print("Error sending video frame, stopping sends."); video_send_success = False; break
+                            if gst_video_pipeline.send_frame(frame): frames_actually_sent_this_batch += 1
+                            else: print("Error sending video frame, stopping sends."); video_send_success = False; break
                     except Exception as e: print(f"Error sending video frame: {e}"); video_send_success = False
 
                     if video_send_success:
-                         try:
-                              if isinstance(audio_chunk, np.ndarray) and audio_chunk.dtype == np.int16:
-                                   if not gst_audio_pipeline.send_audio(audio_chunk): print("Error sending audio chunk.")
-                              else: print(f"Invalid audio chunk type/dtype: {type(audio_chunk)}, {getattr(audio_chunk, 'dtype', 'N/A')}")
-                         except Exception as e: print(f"Error sending audio chunk: {e}")
+                        try:
+                            if isinstance(audio_chunk, np.ndarray) and audio_chunk.dtype == np.int16:
+
+                                # --- ADDED: Timing diagnostics ---
+                                current_time = time.time() # Get current time
+                                if last_audio_send_time is not None:
+                                    time_diff = current_time - last_audio_send_time
+                                    # Only print if time_diff is somewhat meaningful (e.g. > 0.001)
+                                    if time_diff > 0.001:
+                                        print(f"DEBUG (process_frames): Time since last audio send: {time_diff:.4f} s") # Log time difference
+                                        time_diffs.append(time_diff) # Append to list
+                                # --- END ADDED ---
+
+                                if not gst_audio_pipeline.send_audio(audio_chunk):
+                                     print("Error sending audio chunk.")
+                                     # If send_audio fails, don't update last_audio_send_time
+                                else:
+                                     # --- ADDED: Update time only after successful send ---
+                                     last_audio_send_time = current_time # Update last send time
+                                     # --- END ADDED ---
+
+                            else: print(f"Invalid audio chunk type/dtype: {type(audio_chunk)}, {getattr(audio_chunk, 'dtype', 'N/A')}")
+                        except Exception as e: print(f"Error sending audio chunk: {e}")
+
                 elif not prepared_frames and audio_chunk is not None: print("Warning: No frames prepared for batch, audio may desync.")
 
                 total_frames_sent += frames_actually_sent_this_batch
                 batch_counter += 1
-                self.idx += num_frames_in_batch
+                self.idx += num_frames_in_batch # Update index based on processed video frames
 
         print(f"Processing loop finished after {batch_counter} batches. Total frames sent: {total_frames_sent}")
 
+        # --- ADDED: Optional final statistics ---
+        try:
+             if time_diffs: # Only calculate if list is not empty
+                  print(f"DEBUG: Audio send interval stats: Avg={np.mean(time_diffs):.4f}s, StdDev={np.std(time_diffs):.4f}s, Min={np.min(time_diffs):.4f}s, Max={np.max(time_diffs):.4f}s")
+        except NameError:
+             print("DEBUG: Cannot calculate stats, numpy not imported or time_diffs empty?")
+        except Exception as e_stats:
+            print(f"DEBUG: Error calculating stats: {e_stats}")
+        # --- END ADDED ---
+
 
     # ========================================================================
-    # === FINAL inference method with ALL fixes ==============================
+    # === FINAL inference method (WITH CORRECTED AUDIO SLICING & RECON FIX) ==
     # ========================================================================
     def inference(self, audio_path, out_vid_name, fps, skip_save_images):
         res_frame_queue = queue.Queue()
@@ -963,14 +1000,22 @@ class Avatar:
         start_time = time.time()
         frame_count = 0 # Counts frames GENERATED by VAE successfully
 
+        # --- Define target_sr here or ensure it's accessible ---
+        target_sr = 48000
+        # ---
+
         try: # Outer try block for setup and inference loop
             print(f"Starting inference for {audio_path}")
             # --- Initialize GStreamer ---
             try:
+                # Ensure self.batch_size is available (should be set in __init__)
+                if not hasattr(self, 'batch_size'):
+                     raise AttributeError("Avatar object missing 'batch_size' attribute.")
+
                 gst_video_pipeline = GStreamerPipeline(fps=fps) # Pass FPS
                 gst_audio_pipeline = GStreamerAudio()
                 if gst_video_pipeline.process is None or gst_audio_pipeline.process is None:
-                     raise RuntimeError("GStreamer pipeline failed to initialize.")
+                    raise RuntimeError("GStreamer pipeline failed to initialize.")
             except Exception as e_gst:
                 print(f"Fatal Error initializing GStreamer pipelines: {e_gst}"); return
 
@@ -979,26 +1024,24 @@ class Avatar:
             try:
                 whisper_feature = audio_processor.audio2feat(audio_path)
                 whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-                video_len = len(whisper_chunks)
+                video_len = len(whisper_chunks) # video_len is the number of whisper chunks/iterations
 
                 audio_reader = FFmpegAudioReader(audio_path)
-                audio_data = audio_reader.read_full_audio()
+                audio_data = audio_reader.read_full_audio() # Get the FULL audio data
                 if audio_data is None: raise ValueError("Failed to read audio data.")
+                print(f"Full audio length: {len(audio_data)} samples")
 
                 total_iters = video_len
                 print(f"Audio/Feature Chunks (total_iters): {total_iters}, Input Batch Size: {self.batch_size}")
 
-                audio_chunks = split_audio(audio_data, total_iters)
-                if len(audio_chunks) != total_iters:
-                     print(f"Warning: Num audio chunks ({len(audio_chunks)}) != total iters ({total_iters}). Using {len(audio_chunks)} iters.")
-                     total_iters = len(audio_chunks) # Adjust to actual audio chunks
-
+                # Audio is no longer pre-split
             except Exception as e_audio:
-                 print(f"Fatal Error during audio processing: {e_audio}"); raise
+                print(f"Fatal Error during audio processing: {e_audio}"); raise
 
             # --- Setup Processing Thread ---
             self.idx = 0 # Reset index
             process_thread = threading.Thread(target=self.process_frames,
+                                              # Pass total_iters (number of generator iterations)
                                               args=(res_frame_queue, total_iters, gst_video_pipeline, gst_audio_pipeline, skip_save_images))
             process_thread.daemon = True
             process_thread.start()
@@ -1007,6 +1050,10 @@ class Avatar:
             print("Starting main inference loop...")
             global unet, vae, pe, timesteps, device # Ensure models are accessible
             gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+
+            # --- Track audio samples sent ---
+            audio_samples_sent = 0
+            # ---
 
             for i, batch_data in enumerate(tqdm(gen, total=total_iters)):
                 if batch_data is None or len(batch_data) != 2: continue
@@ -1022,94 +1069,108 @@ class Avatar:
                     latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
 
                     # --- Inference ---
+                    # *** THESE LINES MUST BE PRESENT AND UNCOMMENTED ***
                     pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
                     recon = vae.decode_latents(pred_latents) # Returns NumPy uint8 NHWC
+                    # **************************************************
 
                     # --- Process VAE Output ---
                     recon_list = []
-                    if isinstance(recon, np.ndarray) and recon.ndim == 4: # EXPECTED CASE
-                         frames_np = recon # NHWC uint8 is expected
-                         if frames_np.shape[-1] == 3:
-                                # --- USER ACTION REQUIRED: Choose Option A or B based on saved PNGs ---
-                                # Option A: If vae_output_sample_PRE_CONVERSION.png looked correct (VAE outputs BGR uint8)
-                               # print("Debug: Using Option A - Assuming VAE output is BGR uint8.")
-                                recon_list = [f.copy() for f in frames_np]
-
-                                # Option B: If vae_output_sample_POST_CONVERSION.png looked correct (VAE outputs RGB uint8)
-                               # print("Debug: Using Option B - Assuming VAE output is RGB uint8, converting.")
-                              # recon_list = [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in frames_np]
-                                # --- End Choose ---
-                         elif frames_np.shape[-1] == 1:
-                              recon_list = [cv2.cvtColor(f, cv2.COLOR_GRAY2BGR) for f in frames_np]
-                         else: print(f"VAE NumPy unexpected channels: {frames_np.shape[-1]}"); continue
-                    elif isinstance(recon, torch.Tensor): # Fallback if VAE output changes
-                          print(f"Warning: VAE returned Tensor (unexpected). Shape: {recon.shape}"); continue # Add handling if needed
-                    elif isinstance(recon, list): # Fallback
-                          print(f"Warning: VAE returned list (unexpected). Count: {len(recon)}"); continue # Add handling if needed
-                    else: print(f"VAE output unexpected type: {type(recon)}"); continue
-
-
-                    # --- Check and Queue ---
-                    if not recon_list or not all(isinstance(f, np.ndarray) for f in recon_list):
-                         print(f"Warning: recon_list empty/invalid iter {i}. Skipping put.")
-                         continue
-
-                    frame_count += len(recon_list)
-                    if i < len(audio_chunks):
-                        res_frame_queue.put((recon_list, audio_chunks[i]))
+                    if isinstance(recon, np.ndarray) and recon.ndim == 4 and recon.shape[-1] == 3:
+                         # Assuming recon is NHWC BGR uint8 based on previous context
+                         # Adjust if your vae.decode_latents returns RGB or a different format
+                         recon_list = [f.copy() for f in recon]
                     else:
-                        print(f"Warning: Audio chunk index {i} OOB. Skipping put.")
+                        # Add appropriate handling if VAE output is different
+                        print(f"VAE output unexpected shape/type: {type(recon)}, {getattr(recon, 'shape', 'N/A')}")
+                        continue # Skip this batch if output is wrong
+
+                    # --- Check video frames ---
+                    if not recon_list or not all(isinstance(f, np.ndarray) for f in recon_list):
+                        print(f"Warning: recon_list empty/invalid iter {i}. Skipping put.")
+                        continue
+
+                    num_vid_frames = len(recon_list)
+                    frame_count += num_vid_frames # Increment usable frame count
+
+                    # --- Calculate and Slice Correct Audio Chunk ---
+                    current_audio_chunk = None
+                    if fps > 0:
+                        samples_needed_for_batch = int(round(num_vid_frames / fps * target_sr))
+                        start_sample = audio_samples_sent
+                        end_sample = start_sample + samples_needed_for_batch
+                        end_sample = min(end_sample, len(audio_data)) # Ensure not past end
+
+                        if start_sample < end_sample:
+                           current_audio_chunk = audio_data[start_sample:end_sample]
+                           audio_samples_sent += len(current_audio_chunk)
+                        else:
+                            print(f"Warning: No more audio data to slice at iter {i}")
+                            current_audio_chunk = np.array([], dtype=np.int16)
+
+                        # --- Logging for Chunk Size Comparison ---
+                        audio_chunk_samples = len(current_audio_chunk)
+                        expected_audio_samples = samples_needed_for_batch
+                        print(f"DEBUG (inference): Iter {i}: VidFrames={num_vid_frames}, AudSamples={audio_chunk_samples}, ExpectedAudSamples={expected_audio_samples}, Diff={audio_chunk_samples-expected_audio_samples}")
+                        # --- END Logging ---
+                    else:
+                        print("Warning: fps <= 0, cannot calculate audio chunk size.")
+                        continue
+
+                    # --- Queue the data ---
+                    if current_audio_chunk is not None:
+                         res_frame_queue.put((recon_list, current_audio_chunk))
+                    # ---
 
                 except Exception as e_loop:
-                     print(f"\n!!!!! Error in main inference loop iteration {i} !!!!!")
-                     traceback.print_exc(); continue
+                    print(f"\n!!!!! Error in main inference loop iteration {i} !!!!!")
+                    traceback.print_exc(); continue # Use traceback to see where error occurred
             # --- End of Main Loop ---
 
         except Exception as e_inf:
-             print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-             print(f"FATAL ERROR during inference setup or loop: {e_inf}")
-             traceback.print_exc()
-             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-             # Signal processing thread to terminate early if it started
-             if process_thread is not None and process_thread.is_alive():
-                  try: res_frame_queue.put(None) # Try to send sentinel
-                  except: pass # Ignore errors if queue is broken
+            print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print(f"FATAL ERROR during inference setup or loop: {e_inf}")
+            traceback.print_exc()
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            if process_thread is not None and process_thread.is_alive():
+                 try: res_frame_queue.put(None)
+                 except: pass
 
         finally:
-             # --- ENSURE FINAL CLEANUP AND FPS PRINT ---
-             print("\n--- Starting Final Cleanup ---")
-
+            # --- ENSURE FINAL CLEANUP AND FPS PRINT ---
+            print("\n--- Starting Final Cleanup ---")
+            # ... (Cleanup code: signal thread, join thread, stop GStreamer, print FPS - same as before) ...
              # Signal End to Processing Thread
-             try:
-                  print("Signaling process_frames to finish (sending None)...")
-                  res_frame_queue.put(None)
-             except Exception as e_put_none:
-                  print(f"Note: Exception putting None sentinel: {e_put_none}")
+            try:
+                print("Signaling process_frames to finish (sending None)...")
+                res_frame_queue.put(None)
+            except Exception as e_put_none:
+                print(f"Note: Exception putting None sentinel: {e_put_none}")
 
-             # Wait for Processing Thread
-             if process_thread is not None:
-                 print("Waiting for process_frames thread to join...")
-                 process_thread.join(timeout=30) # Wait up to 30s
-                 if process_thread.is_alive(): print("⚠️ Warning: process_frames thread did not finish.")
-                 else: print("✅ process_frames thread joined.")
-             else: print("process_frames thread was not started or already finished.")
+            # Wait for Processing Thread
+            if process_thread is not None:
+                print("Waiting for process_frames thread to join...")
+                process_thread.join(timeout=30) # Wait up to 30s
+                if process_thread.is_alive(): print("⚠️ Warning: process_frames thread did not finish.")
+                else: print("✅ process_frames thread joined.")
+            else: print("process_frames thread was not started or already finished.")
 
-             # Stop GStreamer
-             print("Stopping GStreamer pipelines...")
-             if gst_video_pipeline: gst_video_pipeline.stop()
-             if gst_audio_pipeline: gst_audio_pipeline.stop()
-             print("GStreamer stop commands issued.")
+            # Stop GStreamer
+            print("Stopping GStreamer pipelines...")
+            if gst_video_pipeline: gst_video_pipeline.stop()
+            if gst_audio_pipeline: gst_audio_pipeline.stop()
+            print("GStreamer stop commands issued.")
 
-             # Calculate and Print FPS
-             print("Calculating final FPS...")
-             total_elapsed_time = time.time() - start_time
-             avg_fps = frame_count / total_elapsed_time if total_elapsed_time > 0 else 0
-             print("\n========================================")
-             print(f" Total elapsed time: {total_elapsed_time:.2f} s")
-             print(f" Total frame count generated by VAE: {frame_count}")
-             print(f" Final calculated average FPS: {avg_fps:.2f}")
-             print("========================================")
-             print(">>> Inference method finished.")
+            # Calculate and Print FPS
+            print("Calculating final FPS...")
+            total_elapsed_time = time.time() - start_time
+            avg_fps = frame_count / total_elapsed_time if total_elapsed_time > 0 else 0
+            print("\n========================================")
+            print(f" Total elapsed time: {total_elapsed_time:.2f} s")
+            print(f" Total frame count generated by VAE: {frame_count}") # Use frame_count
+            print(f" Final calculated average FPS (based on VAE output): {avg_fps:.2f}")
+            print("========================================")
+            print(">>> Inference method finished.")
 
 
 # --- Main Execution Block ---
