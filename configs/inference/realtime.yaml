@@ -1,5 +1,5 @@
 avator_1:
- preparation: True
+ preparation: False
  bbox_shift: 5
  video_path: "data/video/sun.mp4"
  audio_clips:
