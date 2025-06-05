@@ -211,7 +211,7 @@ class GStreamerPipeline:
             f"fdsrc fd=0 ! videoparse format=bgr width={self.width} height={self.height} framerate={self.fps}/1 ! "
             "queue leaky=downstream max-size-buffers=5 ! videoconvert ! " # Added leaky queue
             f"video/x-raw,format=NV12,width={self.width},height={self.height},framerate={self.fps}/1 ! queue max-size-buffers=5 ! "
-            f"nvh265enc preset=low-latency-hq rc-mode=cbr bitrate=8000 gop-size=30 ! " # bitrate=8000 for 8 Mbps
+            f"nvh265enc preset=low-latency-hq rc-mode=cbr bitrate=4000 gop-size=30 ! " # bitrate=8000 for 8 Mbps
             "h265parse ! rtph265pay config-interval=1 ! "
             f"udpsink host={self.host} port={self.port} sync=false async=false" # async=false might be important
         )
@@ -434,6 +434,9 @@ class Avatar: # NO @torch.no_grad() here
 
         self.init_avatar_data()
         logging.info(f"Avatar initialization complete for {self.avatar_id}.")
+        logging.info(f"FINAL BATCH SIZE BEING USED: {self.batch_size}")
+
+
 
     def init_avatar_data(self):
         if self.preparation:
@@ -530,7 +533,8 @@ class Avatar: # NO @torch.no_grad() here
         logging.info(f"Initial landmarks/bboxes: {len(coords)} items.")
 
         valid_l, valid_c, valid_f = [], [], []
-        coord_ph_val = coord_placeholder()
+        coord_ph_val = coord_placeholder  # No parentheses - use the tuple directly
+
         global vae # Ensure accessible
         for i, (b, fr) in enumerate(tqdm(zip(coords, frames), total=len(coords), desc="VAE Encoding")):
             if b is None or np.array_equal(b, coord_ph_val) or fr is None: continue
@@ -1083,6 +1087,12 @@ def inference_worker(avatar_instance_ref, target_fps_ref, opus_q_ref):
 # ==================================================================================
 if __name__ == "__main__":
     logging.info("🎬 Starting Realtime Stream Sync (Pipe Reader & Inference Engine)...")
+   
+    # --- Set Process Priority ---
+    if sys.platform == "win32":
+        import psutil
+        p = psutil.Process(os.getpid())
+        p.nice(psutil.HIGH_PRIORITY_CLASS)
 
     # --- Validate Essential Configuration ---
     if not STREAM_PIPE_PATH:
@@ -1108,7 +1118,7 @@ if __name__ == "__main__":
             logging.info(f"Available Avatar IDs in config: {list(inference_config_all.keys())}")
             sys.exit(1)
         
-        avatar_specific_config = inference_config_all[AVATAR_ID_TO_USE]
+        avatar_specific_config = inference_config_all[AVATAR_ID_TO_USE] # type: ignore
         logging.info(f"Loaded configuration for Avatar ID: {AVATAR_ID_TO_USE}")
 
         # Extract parameters for Avatar class instantiation

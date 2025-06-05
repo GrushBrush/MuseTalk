@@ -1,6 +1,7 @@
-avator_1:
+avatar_2:
  preparation: False
- bbox_shift: 5
+ bbox_shift: -2
+ batch_size: 6  # Reduce from 4 to 2
  video_path: "data/video/sun.mp4"
  audio_clips:
      audio_0: "data/audio/sun.wav"
