@@ -16,24 +16,28 @@ import sys
 from tqdm import tqdm
 import copy
 import json
-import traceback          # For detailed error printing in threads
+import traceback        # For detailed error printing in threads
 import time
 from PIL import Image
 import tempfile
-import logging # Added for better logging
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
+import logging
 
+# --- MODIFICATION: Add platform-specific imports for pipes ---
+if sys.platform == "win32":
+    import win32pipe
+    import win32file
+    import pywintypes
 
-# --- Watchdog and DotEnv Imports ---
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- MODIFICATION: Remove Watchdog and use STREAM_PIPE_PATH ---
 from dotenv import load_dotenv
 
 # --- MuseTalk Specific Imports (Ensure these paths are correct) ---
 try:
     from musetalk.utils.utils import get_file_type, get_video_fps, datagen
     from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
-    # from musetalk.utils.blending import get_image_prepare_material # Logic now likely in worker or prepare
+    from musetalk.utils.blending import get_image_prepare_material
     from musetalk.utils.utils import load_all_model
 except ImportError as e:
     print(f"Error importing MuseTalk utilities: {e}")
@@ -44,7 +48,8 @@ import shutil
 
 # --- Configuration Loading ---
 load_dotenv()
-WATCHED_WAV_FILE_PATH = os.getenv("WATCHED_WAV_FILE_PATH")
+# MODIFICATION: Replaced WATCHED_WAV_FILE_PATH with STREAM_PIPE_PATH
+STREAM_PIPE_PATH = os.getenv("STREAM_PIPE_PATH")
 AVATAR_CONFIG_PATH = os.getenv("AVATAR_CONFIG_PATH", "configs/inference/realtime.yaml")
 AVATAR_ID_TO_USE = os.getenv("AVATAR_ID_TO_USE")
 try:
@@ -53,14 +58,8 @@ except ValueError:
     print("Warning: TARGET_FPS in .env is not a valid integer. Using default 25.")
     TARGET_FPS = 25
 
-# --- Basic Logging Setup ---
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S')
-
 # --- Global Lock for Inference ---
 inference_lock = threading.Lock()
-is_inferencing = False # Flag to track inference state
 
 # --- PyTorch Device Setup ---
 cuda_available = torch.cuda.is_available()
@@ -88,7 +87,6 @@ except Exception as e:
 # --- Set Precision ---
 logging.info("Setting model precision to half (FP16) on sub-modules...")
 try:
-    # (Keep the precision setting logic from your original script)
     if hasattr(pe, 'to'): pe = pe.to(device)
     if hasattr(pe, 'half'): pe = pe.half()
     else: logging.warning("Warning: 'pe' object doesn't have .half() method.")
@@ -107,7 +105,7 @@ except Exception as e_prec:
     logging.warning(f"Warning: Error setting model precision/device: {e_prec}")
 timesteps = torch.tensor([0], device=device)
 
-# --- FFmpegAudioReader Class (Keep as is from your script) ---
+# --- FFmpegAudioReader Class ---
 class FFmpegAudioReader:
     def __init__(self, audio_file):
         self.audio_file = audio_file
@@ -139,13 +137,13 @@ class FFmpegAudioReader:
         except FileNotFoundError: logging.error("❌ Error: ffmpeg command not found."); return None
         except Exception as e: logging.error(f"❌ FFmpeg read error: {e}"); return None
 
-# --- GStreamerPipeline Class (Keep as is from your script) ---
+# --- GStreamerPipeline and GStreamerAudio Classes ---
 class GStreamerPipeline:
     def __init__(self, width=720, height=1280, fps=25, host="127.0.0.1", port=5000):
         self.width = width; self.height = height; self.fps = fps; self.host = host; self.port = port; self.process = None
         pipeline_str_fdsrc = (f"fdsrc fd=0 ! videoparse format=bgr width={self.width} height={self.height} framerate={self.fps}/1 ! "
                               "queue ! videoconvert ! video/x-raw,format=NV12 ! queue ! cudaupload ! "
-                              "nvh265enc bitrate=80000 bframes=0 preset=default gop-size=25 ! "
+                              "nvh265enc bitrate=80000 bframes=0 preset=default gop-size=1 ! "
                               "h265parse ! rtph265pay config-interval=1 ! "
                               f"udpsink host={self.host} port={self.port} sync=false")
         logging.info("Starting GStreamer video pipeline...")
@@ -181,14 +179,13 @@ class GStreamerPipeline:
             except Exception as e: logging.error(f"Error waiting for video process: {e}")
         else: logging.info("Video pipeline already stopped.")
 
-# --- GStreamerAudio Class (Keep as is from your script) ---
 class GStreamerAudio:
     def __init__(self, host="127.0.0.1", port=5001):
         self.host = host; self.port = port; self.process = None
         pipeline_str = ("fdsrc fd=0 do-timestamp=true ! audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved ! "
-                        "queue max-size-time=500000000 ! " # ADDED: Queue with 500ms buffer (time in ns)
+                        "queue max-size-time=500000000 ! "
                         "opusenc name=enc bitrate=64000 complexity=4 frame-size=20 ! rtpopuspay name=pay pt=97 ! "
-                        f"udpsink host={self.host} port={self.port} sync=false async=false") # Keep sync=true for now
+                        f"udpsink host={self.host} port={self.port} sync=false async=false")
         logging.info("Starting GStreamer audio pipeline...")
         try:
             self.process = subprocess.Popen(f"gst-launch-1.0 -v {pipeline_str}", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, bufsize=0)
@@ -222,7 +219,7 @@ class GStreamerAudio:
         else: logging.info("Audio pipeline already stopped.")
 
 
-# --- Misc Helper Functions (Keep as is: video2imgs, osmakedirs, process_single_frame_parallel) ---
+# --- Helper Functions ---
 def video2imgs(vid_path, save_path, ext='.png', cut_frame=10000000):
     logging.info(f"Extracting frames from {vid_path} to {save_path}...")
     cap = cv2.VideoCapture(vid_path); count = 0; frame_idx = 0
@@ -231,10 +228,10 @@ def video2imgs(vid_path, save_path, ext='.png', cut_frame=10000000):
         ret, frame = cap.read()
         if not ret: logging.info("Video ended or read error."); break
         if frame_idx % 1 == 0:
-             filename = f"{count:08d}{ext}"; filepath = os.path.join(save_path, filename)
-             try: cv2.imwrite(filepath, frame); count += 1
-             except Exception as e: logging.error(f"Error writing frame {count}: {e}"); break
-             if count >= cut_frame: logging.info(f"Reached cut_frame limit: {cut_frame}"); break
+            filename = f"{count:08d}{ext}"; filepath = os.path.join(save_path, filename)
+            try: cv2.imwrite(filepath, frame); count += 1
+            except Exception as e: logging.error(f"Error writing frame {count}: {e}"); break
+            if count >= cut_frame: logging.info(f"Reached cut_frame limit: {cut_frame}"); break
         frame_idx += 1
     cap.release(); logging.info(f"Finished extracting {count} frames.")
 
@@ -243,7 +240,6 @@ def osmakedirs(path_list):
         try: os.makedirs(path, exist_ok=True)
         except Exception as e: logging.error(f"Error creating directory {path}: {e}")
 
-# --- IMPORTANT: Ensure this uses the exact logic from your working script ---
 def process_single_frame_parallel(args):
     self, i, start_idx, res_frame, gst_video_pipeline_width, gst_video_pipeline_height = args
     try:
@@ -300,12 +296,9 @@ def process_single_frame_parallel(args):
         else: logging.warning(f"Warning(worker): combine_frame None frame {i}."); return i, None
     except Exception as e_worker: logging.error(f"!!!!! Error(worker): Unexpected error frame {i} !!!!!"); traceback.print_exc(); return i, None
 
-# --- Avatar Class (Keep as is, including __init__, init, _reload_prepared_data, prepare_material, process_frames, inference) ---
-# Make sure all necessary global variables (models like vae, unet, pe, audio_processor) are accessible
-# Ensure the `inference` method correctly uses the provided `audio_path` and `fps`
+# --- Avatar Class ---
 @torch.no_grad()
 class Avatar:
-    # (Keep the __init__, init, _reload_prepared_data, prepare_material methods EXACTLY as in your working script)
     def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation):
         logging.info(f"Initializing Avatar: {avatar_id}")
         self.avatar_id = avatar_id; self.video_path = video_path; self.bbox_shift = bbox_shift
@@ -321,32 +314,32 @@ class Avatar:
         logging.info(f"Avatar initialization complete for {avatar_id}.")
 
     def init(self):
-         if self.preparation:
-             if os.path.exists(self.avatar_path):
-                 try:
-                      response = input(f"Avatar '{self.avatar_id}' exists. Re-create? (y/n): ")
-                      if response.lower() == "y":
-                          logging.info(f"Removing existing avatar data: {self.avatar_path}"); shutil.rmtree(self.avatar_path)
-                          self.prepare_material()
-                      else: logging.info("Attempting load existing data..."); self._reload_prepared_data()
-                 except Exception as e_input: logging.warning(f"Error user input: {e_input}. Assuming 'n'."); logging.info("Attempting load existing data..."); self._reload_prepared_data()
-             else: logging.info(f"Avatar path {self.avatar_path} not exist. Preparing..."); self.prepare_material()
-         else:
-              required_files = [self.coords_path, self.latents_out_path, self.mask_coords_path, self.mask_out_path, self.full_imgs_path]
-              if not all(os.path.exists(p) for p in required_files):
-                   logging.error(f"Error: Not all required data found in {self.avatar_path} and preparation=False."); logging.error(f" Missing: {[p for p in required_files if not os.path.exists(p)]}"); sys.exit(1)
-              else: logging.info("Preparation=False. Loading existing data..."); self._reload_prepared_data()
-              try:
-                   if os.path.exists(self.avatar_info_path):
-                        with open(self.avatar_info_path, "r") as f: avatar_info_disk = json.load(f)
-                        if avatar_info_disk.get('bbox_shift') != self.avatar_info['bbox_shift']: logging.error(f"Error: bbox_shift changed since preparation. Current: {self.avatar_info['bbox_shift']}, Prepared: {avatar_info_disk.get('bbox_shift')}"); sys.exit(1)
-                   else: logging.warning(f"Warning: {self.avatar_info_path} not found. Cannot check consistency.")
-              except Exception as e_info: logging.warning(f"Warning: Could not check avatar info: {e_info}")
+        if self.preparation:
+            if os.path.exists(self.avatar_path):
+                try:
+                    response = input(f"Avatar '{self.avatar_id}' exists. Re-create? (y/n): ")
+                    if response.lower() == "y":
+                        logging.info(f"Removing existing avatar data: {self.avatar_path}"); shutil.rmtree(self.avatar_path)
+                        self.prepare_material()
+                    else: logging.info("Attempting load existing data..."); self._reload_prepared_data()
+                except Exception as e_input: logging.warning(f"Error user input: {e_input}. Assuming 'n'."); logging.info("Attempting load existing data..."); self._reload_prepared_data()
+            else: logging.info(f"Avatar path {self.avatar_path} not exist. Preparing..."); self.prepare_material()
+        else:
+            required_files = [self.coords_path, self.latents_out_path, self.mask_coords_path, self.mask_out_path, self.full_imgs_path]
+            if not all(os.path.exists(p) for p in required_files):
+                logging.error(f"Error: Not all required data found in {self.avatar_path} and preparation=False."); logging.error(f" Missing: {[p for p in required_files if not os.path.exists(p)]}"); sys.exit(1)
+            else: logging.info("Preparation=False. Loading existing data..."); self._reload_prepared_data()
+            try:
+                if os.path.exists(self.avatar_info_path):
+                    with open(self.avatar_info_path, "r") as f: avatar_info_disk = json.load(f)
+                    if avatar_info_disk.get('bbox_shift') != self.avatar_info['bbox_shift']: logging.error(f"Error: bbox_shift changed since preparation. Current: {self.avatar_info['bbox_shift']}, Prepared: {avatar_info_disk.get('bbox_shift')}"); sys.exit(1)
+                else: logging.warning(f"Warning: {self.avatar_info_path} not found. Cannot check consistency.")
+            except Exception as e_info: logging.warning(f"Warning: Could not check avatar info: {e_info}")
 
     def _reload_prepared_data(self):
-         logging.info("Reloading prepared data into instance variables...")
-         all_loaded = True
-         try:
+        logging.info("Reloading prepared data into instance variables...")
+        all_loaded = True
+        try:
             logging.info(f" Loading latents: {self.latents_out_path}")
             self.input_latent_list_cycle = torch.load(self.latents_out_path, map_location='cpu')
             if isinstance(self.input_latent_list_cycle, torch.Tensor): self.input_latent_list_cycle = list(self.input_latent_list_cycle)
@@ -368,13 +361,13 @@ class Avatar:
             data_lists = {"Coords": self.coord_list_cycle,"Frames": self.frame_list_cycle,"Masks": self.mask_list_cycle,"MaskCoords": self.mask_coords_list_cycle,"Latents": self.input_latent_list_cycle}
             list_lengths = {}
             for name, data_list in data_lists.items():
-                 if data_list is None or not isinstance(data_list, list) or len(data_list) == 0: logging.error(f"Error: Data list '{name}' invalid after load."); all_loaded = False; break
-                 list_lengths[name] = len(data_list)
+                if data_list is None or not isinstance(data_list, list) or len(data_list) == 0: logging.error(f"Error: Data list '{name}' invalid after load."); all_loaded = False; break
+                list_lengths[name] = len(data_list)
             if all_loaded and len(set(list_lengths.values())) > 1: logging.error(f"Error: Lengths of loaded data lists mismatch! Lengths: {list_lengths}"); all_loaded = False
             if not all_loaded: raise ValueError("Failed load/validate all required data.")
             logging.info(f"Successfully reloaded {list_lengths.get('Frames', 0)} items.")
-         except FileNotFoundError as e: logging.error(f"Error reloading: File not found - {e}"); raise SystemExit(f"Missing prepared file: {e}")
-         except Exception as e: logging.error(f"Error reloading prepared data: {e}"); traceback.print_exc(); raise SystemExit(f"Failed reload data: {e}")
+        except FileNotFoundError as e: logging.error(f"Error reloading: File not found - {e}"); raise SystemExit(f"Missing prepared file: {e}")
+        except Exception as e: logging.error(f"Error reloading prepared data: {e}"); traceback.print_exc(); raise SystemExit(f"Failed reload data: {e}")
 
     def prepare_material(self):
         logging.info(f"--- Preparing material for avatar: {self.avatar_id} ---")
@@ -411,9 +404,9 @@ class Avatar:
             crop_frame = frame[y1c:y2c, x1c:x2c]
             if crop_frame.size == 0: continue
             try:
-                 resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
-                 latents = vae.get_latents_for_unet(resized_crop_frame)
-                 input_latent_list.append(latents); valid_coords.append(bbox); valid_frames.append(frame); valid_indices.append(i)
+                resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                latents = vae.get_latents_for_unet(resized_crop_frame)
+                input_latent_list.append(latents); valid_coords.append(bbox); valid_frames.append(frame); valid_indices.append(i)
             except Exception as e: logging.warning(f"Error VAE frame {i}: {e}"); continue
         if not input_latent_list: logging.error("Error: No valid latents generated."); sys.exit(1)
         logging.info(f"Generated {len(input_latent_list)} valid latents.")
@@ -424,35 +417,32 @@ class Avatar:
 
         logging.info("Generating masks...")
         mask_coords_list_cycle_prep, mask_list_cycle_prep = [], []
-        # --- Mask Generation (Ensure get_image_prepare_material is defined/imported) ---
-        # Assuming get_image_prepare_material exists and works as before
-        global get_image_prepare_material # Check if it exists
+        global get_image_prepare_material
         if 'get_image_prepare_material' not in globals(): logging.error("Error: Blending function 'get_image_prepare_material' missing."); sys.exit(1)
         processed_indices = set(); temp_mask_data = {}
         for i, frame in enumerate(tqdm(frame_list_cycle_prep, desc="Mask Gen")):
             face_box = coord_list_cycle_prep[i]
             try:
-                 mask, crop_box = get_image_prepare_material(frame, face_box) # CALL THE FUNCTION
-                 if mask is None or crop_box is None: logging.warning(f"Warning: Mask gen fail frame {i}. Skip."); continue
-                 cv2.imwrite(f"{self.mask_out_path}/{str(i).zfill(8)}.png", mask)
-                 temp_mask_data[i] = (mask, crop_box); processed_indices.add(i)
+                mask, crop_box = get_image_prepare_material(frame, face_box)
+                if mask is None or crop_box is None: logging.warning(f"Warning: Mask gen fail frame {i}. Skip."); continue
+                cv2.imwrite(f"{self.mask_out_path}/{str(i).zfill(8)}.png", mask)
+                temp_mask_data[i] = (mask, crop_box); processed_indices.add(i)
             except Exception as e: logging.warning(f"Error mask gen frame {i}: {e}"); continue
-        # --- End Mask Generation ---
 
         logging.info(f"Filtering cycles based on {len(processed_indices)} successful masks...")
         final_frame_list_cycle, final_coord_list_cycle, final_input_latent_list_cycle = [], [], []
         final_mask_list_cycle, final_mask_coords_list_cycle = [], []
         for i in range(num_cycle_frames):
-             if i in processed_indices:
-                  frame_path = os.path.join(self.full_imgs_path, f"{i:08d}.png"); mask_path = os.path.join(self.mask_out_path, f"{i:08d}.png")
-                  if os.path.exists(mask_path) and os.path.exists(frame_path):
-                       frame_img = cv2.imread(frame_path); mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                       if frame_img is not None and mask_img is not None:
-                           final_frame_list_cycle.append(frame_img); final_coord_list_cycle.append(coord_list_cycle_prep[i])
-                           final_input_latent_list_cycle.append(input_latent_list_cycle_prep[i]); mask_data, crop_box_data = temp_mask_data[i]
-                           final_mask_list_cycle.append(mask_data); final_mask_coords_list_cycle.append(crop_box_data)
-                       else: logging.warning(f"Warning: Failed read frame/mask {i}, skip.")
-                  else: logging.warning(f"Warning: Missing frame/mask file index {i}, skip.")
+            if i in processed_indices:
+                frame_path = os.path.join(self.full_imgs_path, f"{i:08d}.png"); mask_path = os.path.join(self.mask_out_path, f"{i:08d}.png")
+                if os.path.exists(mask_path) and os.path.exists(frame_path):
+                    frame_img = cv2.imread(frame_path); mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    if frame_img is not None and mask_img is not None:
+                        final_frame_list_cycle.append(frame_img); final_coord_list_cycle.append(coord_list_cycle_prep[i])
+                        final_input_latent_list_cycle.append(input_latent_list_cycle_prep[i]); mask_data, crop_box_data = temp_mask_data[i]
+                        final_mask_list_cycle.append(mask_data); final_mask_coords_list_cycle.append(crop_box_data)
+                    else: logging.warning(f"Warning: Failed read frame/mask {i}, skip.")
+                else: logging.warning(f"Warning: Missing frame/mask file index {i}, skip.")
         logging.info("Saving final prepared data...")
         final_len = len(final_frame_list_cycle)
         if not all(len(lst) == final_len for lst in [final_coord_list_cycle, final_input_latent_list_cycle, final_mask_list_cycle, final_mask_coords_list_cycle]): logging.error(f"Error: Final lengths mismatch after filter!"); sys.exit(1)
@@ -464,66 +454,61 @@ class Avatar:
         logging.info(f"--- Material preparation complete. Final cycle: {final_len} frames. ---")
         self._reload_prepared_data()
 
-    # (Keep process_frames EXACTLY as in your working script)
     def process_frames(self, res_frame_queue, video_len, gst_video_pipeline, gst_audio_pipeline, skip_save_images, debug=False):
-         num_workers = max(1, os.cpu_count() - 2)
-         logging.info(f"--- Start process_frames with {num_workers} workers ---")
-         if not hasattr(self, 'coord_list_cycle') or not self.coord_list_cycle: logging.error("Error: Avatar ref data not loaded."); return
-         batch_counter = 0; total_frames_sent = 0; last_audio_send_time = None; time_diffs = []
-         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-             while True:
-                 current_loop_start_idx = self.idx
-                 if batch_counter >= video_len: logging.info(f"Processed target batches ({batch_counter}/{video_len}). Finish."); break
-                 try: batch = res_frame_queue.get(block=True, timeout=10)
-                 except queue.Empty: logging.info(f"Queue empty timeout ({batch_counter}/{video_len} batches)."); continue
-                 if batch is None: logging.info("Received None sentinel. Finish."); break
-                 if not isinstance(batch, tuple) or len(batch) != 2: logging.warning(f"Invalid batch type: {type(batch)}. Skip."); continue
-                 frames, audio_chunk = batch
-                 if not isinstance(frames, list) or len(frames) == 0: logging.warning(f"Invalid frames list. Skip."); batch_counter += 1; continue
-                 if not all(isinstance(f, np.ndarray) for f in frames): logging.warning(f"Not all frames NumPy. Skip."); batch_counter += 1; continue
-                 num_frames_in_batch = len(frames)
-                 args_list = [(self, i, current_loop_start_idx, frame, gst_video_pipeline.width, gst_video_pipeline.height) for i, frame in enumerate(frames)]
-                 results_with_indices = []
-                 try: results_with_indices = list(executor.map(process_single_frame_parallel, args_list))
-                 except Exception as e_map: logging.error(f"Error executor.map batch {batch_counter}: {e_map}"); batch_counter += 1; self.idx += num_frames_in_batch; continue
-                 prepared_frames_dict = {}; successful_frames_in_batch = 0
-                 for result_tuple in results_with_indices:
-                     if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
-                         i, result_frame = result_tuple
-                         if result_frame is not None: prepared_frames_dict[i] = result_frame; successful_frames_in_batch += 1
-                     else: logging.warning(f"Warning: Worker returned bad format: {result_tuple}")
-                 prepared_frames = [prepared_frames_dict[i] for i in range(num_frames_in_batch) if i in prepared_frames_dict]
-                 frames_actually_sent_this_batch = 0
-                 if prepared_frames and audio_chunk is not None:
-                     video_send_success = True
-                     try:
-                         for frame in prepared_frames:
-                             if gst_video_pipeline.send_frame(frame): frames_actually_sent_this_batch += 1
-                             else: logging.error("Error sending video frame, stop sends."); video_send_success = False; break
-                     except Exception as e: logging.error(f"Error sending video frame: {e}"); video_send_success = False
-                     if video_send_success:
-                         try:
-                             if isinstance(audio_chunk, np.ndarray) and audio_chunk.dtype == np.int16:
-                                 current_time = time.time()
-                                 if last_audio_send_time is not None:
-                                     time_diff = current_time - last_audio_send_time
-                                     if time_diff > 0.001: logging.debug(f"DEBUG: Time since last audio send: {time_diff:.4f} s"); time_diffs.append(time_diff)
-                                 if not gst_audio_pipeline.send_audio(audio_chunk): logging.error("Error sending audio chunk.")
-                                 else: last_audio_send_time = current_time
-                             else: logging.warning(f"Invalid audio chunk type/dtype: {type(audio_chunk)}, {getattr(audio_chunk, 'dtype', 'N/A')}")
-                         except Exception as e: logging.error(f"Error sending audio chunk: {e}")
-                 elif not prepared_frames and audio_chunk is not None: logging.warning("Warning: No frames prepared, audio may desync.")
-                 total_frames_sent += frames_actually_sent_this_batch
-                 batch_counter += 1; self.idx += num_frames_in_batch
-         logging.info(f"Process loop finished after {batch_counter} batches. Total frames sent: {total_frames_sent}")
-         try:
-             if time_diffs: logging.debug(f"DEBUG: Audio send stats: Avg={np.mean(time_diffs):.4f}s, Std={np.std(time_diffs):.4f}s, Min={np.min(time_diffs):.4f}s, Max={np.max(time_diffs):.4f}s")
-         except Exception as e_stats: logging.warning(f"DEBUG: Error calc stats: {e_stats}")
+        num_workers = max(1, os.cpu_count() - 2)
+        logging.info(f"--- Start process_frames with {num_workers} workers ---")
+        if not hasattr(self, 'coord_list_cycle') or not self.coord_list_cycle: logging.error("Error: Avatar ref data not loaded."); return
+        batch_counter = 0; total_frames_sent = 0; last_audio_send_time = None; time_diffs = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            while True:
+                current_loop_start_idx = self.idx
+                if batch_counter >= video_len: logging.info(f"Processed target batches ({batch_counter}/{video_len}). Finish."); break
+                try: batch = res_frame_queue.get(block=True, timeout=10)
+                except queue.Empty: logging.info(f"Queue empty timeout ({batch_counter}/{video_len} batches)."); continue
+                if batch is None: logging.info("Received None sentinel. Finish."); break
+                if not isinstance(batch, tuple) or len(batch) != 2: logging.warning(f"Invalid batch type: {type(batch)}. Skip."); continue
+                frames, audio_chunk = batch
+                if not isinstance(frames, list) or len(frames) == 0: logging.warning(f"Invalid frames list. Skip."); batch_counter += 1; continue
+                if not all(isinstance(f, np.ndarray) for f in frames): logging.warning(f"Not all frames NumPy. Skip."); batch_counter += 1; continue
+                num_frames_in_batch = len(frames)
+                args_list = [(self, i, current_loop_start_idx, frame, gst_video_pipeline.width, gst_video_pipeline.height) for i, frame in enumerate(frames)]
+                results_with_indices = []
+                try: results_with_indices = list(executor.map(process_single_frame_parallel, args_list))
+                except Exception as e_map: logging.error(f"Error executor.map batch {batch_counter}: {e_map}"); batch_counter += 1; self.idx += num_frames_in_batch; continue
+                prepared_frames_dict = {}; successful_frames_in_batch = 0
+                for result_tuple in results_with_indices:
+                    if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                        i, result_frame = result_tuple
+                        if result_frame is not None: prepared_frames_dict[i] = result_frame; successful_frames_in_batch += 1
+                    else: logging.warning(f"Warning: Worker returned bad format: {result_tuple}")
+                prepared_frames = [prepared_frames_dict[i] for i in range(num_frames_in_batch) if i in prepared_frames_dict]
+                frames_actually_sent_this_batch = 0
+                if prepared_frames and audio_chunk is not None:
+                    video_send_success = True
+                    try:
+                        for frame in prepared_frames:
+                            if gst_video_pipeline.send_frame(frame): frames_actually_sent_this_batch += 1
+                            else: logging.error("Error sending video frame, stop sends."); video_send_success = False; break
+                    except Exception as e: logging.error(f"Error sending video frame: {e}"); video_send_success = False
+                    if video_send_success:
+                        try:
+                            if isinstance(audio_chunk, np.ndarray) and audio_chunk.dtype == np.int16:
+                                current_time = time.time()
+                                if last_audio_send_time is not None:
+                                    time_diff = current_time - last_audio_send_time
+                                    if time_diff > 0.001: logging.debug(f"DEBUG: Time since last audio send: {time_diff:.4f} s"); time_diffs.append(time_diff)
+                                if not gst_audio_pipeline.send_audio(audio_chunk): logging.error("Error sending audio chunk.")
+                                else: last_audio_send_time = current_time
+                            else: logging.warning(f"Invalid audio chunk type/dtype: {type(audio_chunk)}, {getattr(audio_chunk, 'dtype', 'N/A')}")
+                        except Exception as e: logging.error(f"Error sending audio chunk: {e}")
+                elif not prepared_frames and audio_chunk is not None: logging.warning("Warning: No frames prepared, audio may desync.")
+                total_frames_sent += frames_actually_sent_this_batch
+                batch_counter += 1; self.idx += num_frames_in_batch
+        logging.info(f"Process loop finished after {batch_counter} batches. Total frames sent: {total_frames_sent}")
+        try:
+            if time_diffs: logging.debug(f"DEBUG: Audio send stats: Avg={np.mean(time_diffs):.4f}s, Std={np.std(time_diffs):.4f}s, Min={np.min(time_diffs):.4f}s, Max={np.max(time_diffs):.4f}s")
+        except Exception as e_stats: logging.warning(f"DEBUG: Error calc stats: {e_stats}")
 
-    # (Keep inference EXACTLY as in your working script)
-    # ========================================================================
-    # === FINAL inference method (WITH CHUNK SIZE LOGS ADDED) ================
-    # ========================================================================
     def inference(self, audio_path, out_vid_name, fps, skip_save_images):
         res_frame_queue = queue.Queue()
         gst_video_pipeline = None; gst_audio_pipeline = None; process_thread = None
@@ -541,31 +526,26 @@ class Avatar:
             try:
                 whisper_feature = audio_processor.audio2feat(audio_path)
                 whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-                video_len = len(whisper_chunks) # number of whisper chunks/iterations
+                video_len = len(whisper_chunks)
 
                 audio_reader = FFmpegAudioReader(audio_path)
-                audio_data = audio_reader.read_full_audio() # Get the FULL audio data
+                audio_data = audio_reader.read_full_audio()
                 if audio_data is None: raise ValueError("Failed read audio.")
                 logging.info(f"Full audio length: {len(audio_data)} samples")
 
                 total_iters = video_len
                 logging.info(f"Audio/Feature Chunks: {total_iters}, Input Batch Size: {self.batch_size}")
 
-                # Audio is no longer pre-split
             except Exception as e_audio: logging.error(f"Fatal audio processing error: {e_audio}"); raise
 
             self.idx = 0
-            # --- Pass total_iters to process_frames thread ---
             process_thread = threading.Thread(target=self.process_frames, args=(res_frame_queue, total_iters, gst_video_pipeline, gst_audio_pipeline, skip_save_images))
             process_thread.daemon = True; process_thread.start()
 
             logging.info("Starting main inference loop...")
             global unet, vae, pe, timesteps, device
             gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-
-            # --- Track audio samples sent ---
             audio_samples_sent = 0
-            # ---
 
             for i, batch_data in enumerate(tqdm(gen, total=total_iters)):
                 if batch_data is None or len(batch_data) != 2: continue
@@ -573,72 +553,54 @@ class Avatar:
                 if whisper_batch is None or latent_batch is None: continue
 
                 try:
-                    # --- Prepare Batch ---
                     audio_feature_batch = torch.from_numpy(whisper_batch).to(device=device, dtype=unet.model.dtype, non_blocking=True); audio_feature_batch = pe(audio_feature_batch)
                     if not isinstance(latent_batch, torch.Tensor): latent_batch = torch.stack(latent_batch)
                     latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
 
-                    # --- Inference ---
                     pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-                    recon = vae.decode_latents(pred_latents) # NumPy uint8 NHWC BGR
+                    recon = vae.decode_latents(pred_latents)
 
-                    # --- Process VAE Output ---
                     recon_list = []
                     if isinstance(recon, np.ndarray) and recon.ndim == 4 and recon.shape[-1] == 3:
-                        recon_list = [f.copy() for f in recon] # Assumes BGR
+                        recon_list = [f.copy() for f in recon]
                     else:
                         logging.warning(f"VAE output unexpected shape/type: {type(recon)}, {getattr(recon, 'shape', 'N/A')}"); continue
-
-                    # --- Check video frames ---
                     if not recon_list or not all(isinstance(f, np.ndarray) for f in recon_list):
                         logging.warning(f"Warning: recon_list empty/invalid iter {i}. Skip put."); continue
-
                     num_vid_frames = len(recon_list); frame_count += num_vid_frames
 
-                    # --- Calculate and Slice Correct Audio Chunk ---
                     current_audio_chunk = None
                     if fps > 0:
-                        expected_audio_samples = int(round(num_vid_frames / fps * target_sr)) # Calculate expected samples first
+                        expected_audio_samples = int(round(num_vid_frames / fps * target_sr))
                         start_sample = audio_samples_sent
-                        end_sample = start_sample + expected_audio_samples # Use expected for ideal end
-                        end_sample = min(end_sample, len(audio_data)) # Clamp to actual data length
+                        end_sample = start_sample + expected_audio_samples
+                        end_sample = min(end_sample, len(audio_data))
 
-                        if start_sample < end_sample: # Check if there's audio left to slice
-                           current_audio_chunk = audio_data[start_sample:end_sample]
-                           audio_samples_sent += len(current_audio_chunk) # Update based on actual slice length
+                        if start_sample < end_sample:
+                            current_audio_chunk = audio_data[start_sample:end_sample]
+                            audio_samples_sent += len(current_audio_chunk)
                         else:
                             logging.warning(f"Warning: No more audio data to slice at iter {i} (start_sample={start_sample})")
-                            current_audio_chunk = np.array([], dtype=np.int16) # Send empty chunk
+                            current_audio_chunk = np.array([], dtype=np.int16)
 
-                        # --- ADDED: Logging for Chunk Size Comparison ---
                         audio_chunk_samples = len(current_audio_chunk)
                         logging.debug(f"DEBUG (inference): Iter {i}: VidFrames={num_vid_frames}, AudSamples={audio_chunk_samples}, ExpAud={expected_audio_samples}, Diff={audio_chunk_samples-expected_audio_samples}")
-                        # --- END ADDED ---
                     else:
                         logging.warning("Warning: fps <= 0, cannot calculate audio chunk size."); continue
 
-                    # --- Queue the data ---
                     if current_audio_chunk is not None:
-                         res_frame_queue.put((recon_list, current_audio_chunk))
-                    # ---
+                        res_frame_queue.put((recon_list, current_audio_chunk))
 
                 except Exception as e_loop:
-                    # Use f-string for cleaner formatting
                     logging.error(f"\n!!!!! Error main inference loop iter {i} !!!!!")
-                    # Use logging.exception to include traceback automatically if needed,
-                    # or keep traceback.print_exc() if preferred.
-                    # logging.exception("Error details:")
-                    traceback.print_exc(); continue # Continue to next iteration
+                    traceback.print_exc(); continue
 
         except Exception as e_inf:
             logging.error(f"\n!!!!! FATAL ERROR inference setup/loop: {e_inf} !!!!!")
             traceback.print_exc()
-            # Signal processing thread to terminate early if it started (moved inside finally is safer)
 
         finally:
             logging.info("\n--- Starting Final Cleanup ---")
-            # Signal End to Processing Thread
-            # Ensure process_thread exists before putting None in queue in case of early exit
             if 'process_thread' in locals() and process_thread is not None and process_thread.is_alive():
                 try:
                     logging.info("Signaling process_frames finish...")
@@ -646,22 +608,19 @@ class Avatar:
                 except Exception as e_put_none:
                     logging.warning(f"Note: Exception putting None sentinel: {e_put_none}")
 
-            # Wait for Processing Thread
             if 'process_thread' in locals() and process_thread is not None:
                 logging.info("Waiting process_frames thread join...")
-                process_thread.join(timeout=30) # Wait up to 30s
+                process_thread.join(timeout=30)
                 if process_thread.is_alive(): logging.warning("⚠️ Warning: process_frames thread did not finish.")
                 else: logging.info("✅ process_frames thread joined.")
             else:
                 logging.info("process_frames thread not started or already finished.")
 
-            # Stop GStreamer
             logging.info("Stopping GStreamer pipelines...")
             if gst_video_pipeline: gst_video_pipeline.stop()
             if gst_audio_pipeline: gst_audio_pipeline.stop()
             logging.info("GStreamer stop commands issued.")
 
-            # Calculate and Print FPS
             logging.info("Calculating final FPS...")
             total_elapsed_time = time.time() - start_time;
             avg_fps = frame_count / total_elapsed_time if total_elapsed_time > 0 else 0
@@ -673,120 +632,218 @@ class Avatar:
             logging.info(">>> Inference method finished.")
 
 
-# --- Watchdog Event Handler ---
-class WavFileHandler(FileSystemEventHandler):
-    """Handles filesystem events for the target WAV file."""
-    def __init__(self, target_file_path, avatar_instance, fps):
-        self.target_file_path = os.path.abspath(target_file_path)
-        self.avatar = avatar_instance
-        self.fps = fps
-        self.last_processed_time = 0
-        self.debounce_time = 0.5 # Seconds to wait after modification before processing
-        logging.info(f"Handler initialized. Watching for: {self.target_file_path}")
-        logging.info(f"Using Avatar ID: {self.avatar.avatar_id}, FPS: {self.fps}")
+# --- MODIFICATION: New function to process the stream from the pipe ---
+def process_pipe_stream(opus_data, avatar_instance, fps):
+    """
+    Takes raw opus data from the pipe, saves it to a temporary file,
+    and triggers the avatar inference.
+    """
+    global inference_lock
+    tmp_audio_file_name = None  # To store the name for manual deletion
 
-    def process_wav(self):
-        global is_inferencing # Use global flag
+    if not inference_lock.acquire(blocking=False):
+        logging.warning("Inference already in progress. Skipping newly received audio stream.")
+        return
 
-        if not inference_lock.acquire(blocking=False):
-            logging.warning("Inference already in progress. Skipping trigger.")
-            return
+    try:
+        logging.info(f"--- Inference Lock Acquired --- Received {len(opus_data)} bytes from pipe.")
 
-        is_inferencing = True # Set flag
-        logging.info("--- Inference Lock Acquired ---")
-        try:
-            # Check file existence and size again before processing
-            if not os.path.exists(self.target_file_path):
-                logging.warning(f"File {self.target_file_path} disappeared before processing.")
-                return
-            if os.path.getsize(self.target_file_path) < 1024: # Basic sanity check for size
-                 logging.warning(f"File {self.target_file_path} seems too small. Skipping processing.")
-                 return
+        # 1. Create the temporary file with delete=False
+        # We need to get its name, then close it so ffmpeg can access it.
+        temp_file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=".opus", mode='wb')
+        temp_file_obj.write(opus_data)
+        tmp_audio_file_name = temp_file_obj.name  # Get the file name
+        temp_file_obj.close()  # IMPORTANT: Close the file handle now!
+        
+        logging.info(f"Stream data written to temporary file: {tmp_audio_file_name}, which is now closed.")
 
-            logging.info(f"Starting inference for: {self.target_file_path}")
-            # --- Call the Avatar's inference method ---
-            self.avatar.inference(
-                audio_path=self.target_file_path,
-                out_vid_name="watched_output", # Or generate a dynamic name
-                fps=self.fps,
+        if tmp_audio_file_name: # Ensure we have a name
+            # Call the existing, stable inference method with the path to the temp file
+            # Now ffmpeg should be able to access it without permission issues.
+            avatar_instance.inference(
+                audio_path=tmp_audio_file_name,
+                out_vid_name="streamed_output", # Or generate a dynamic name
+                fps=fps,
                 skip_save_images=True # Assuming we don't need to save intermediate images
             )
-            # ------------------------------------------
-            logging.info(f"Finished inference for: {self.target_file_path}")
+        else:
+            logging.error("Temporary audio file name was not obtained. Skipping inference.")
 
-        except Exception as e:
-            logging.error(f"Error during inference processing for {self.target_file_path}:")
-            logging.error(traceback.format_exc()) # Log full traceback
-        finally:
-            is_inferencing = False # Reset flag
-            inference_lock.release()
-            logging.info("--- Inference Lock Released ---")
+    except Exception as e:
+        logging.error(f"Error during inference processing for stream:")
+        logging.error(traceback.format_exc()) # Log full traceback
+    finally:
+        # 3. Manually delete the temporary file after inference is done
+        if tmp_audio_file_name and os.path.exists(tmp_audio_file_name):
+            try:
+                os.unlink(tmp_audio_file_name)
+                logging.info(f"Temporary file {tmp_audio_file_name} deleted.")
+            except Exception as e_del:
+                logging.error(f"Error deleting temporary file {tmp_audio_file_name}: {e_del}")
+        
+        inference_lock.release()
+        logging.info("--- Inference Lock Released --- Ready for next stream.")
 
+# --- MODIFICATION: Main execution block is now a pipe listener loop ---
+def main_pipe_listener(pipe_path, avatar_instance, fps):
+    """
+    The new main loop that continuously listens to the named pipe for audio data.
+    """
+    logging.info(f"🚀 Starting pipe listener...")
+    logging.info(f"👂 Listening for audio stream on pipe: {pipe_path}")
 
-    def on_modified(self, event):
-        """Called when a file or directory is modified."""
-        if not event.is_directory and os.path.abspath(event.src_path) == self.target_file_path:
-            current_time = time.time()
-            logging.info(f"Detected modification: {event.src_path}")
+    while True: # Outer loop to keep trying to connect and read
+        pipe_handle = None
+        try:
+            opus_data = b''
+            # Platform-specific pipe reading logic
+            if sys.platform == "win32":
+                pipe_name = r'\\.\pipe\\' + os.path.basename(pipe_path)
+                
+                # --- MODIFICATION: Add retry logic for CreateFile ---
+                max_connect_attempts = 15  # Try to connect for a longer period (e.g., 15 attempts * 1s = 15s)
+                connect_attempt_delay = 1  # Seconds to wait between attempts
+                connected = False
 
-            # Debounce: Check if enough time has passed since the last modification event
-            if current_time - getattr(self, '_last_event_time', 0) < self.debounce_time:
-                # logging.debug("Debounce active, skipping immediate processing.") # Optional debug log
-                setattr(self, '_last_event_time', current_time) # Update last event time
-                # Schedule a check after debounce time if not already scheduled
-                if not getattr(self, '_debounce_timer', None) or not self._debounce_timer.is_alive():
-                     self._debounce_timer = threading.Timer(self.debounce_time, self.check_and_process, args=[current_time])
-                     self._debounce_timer.start()
-                     logging.debug(f"Scheduled processing check in {self.debounce_time}s.")
+                for attempt in range(max_connect_attempts):
+                    try:
+                        logging.info(f"Attempting to connect to Windows pipe: {pipe_name} (Attempt {attempt + 1}/{max_connect_attempts})")
+                        pipe_handle = win32file.CreateFile(
+                            pipe_name,
+                            win32file.GENERIC_READ,
+                            win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE, # Allow sharing
+                            None,
+                            win32file.OPEN_EXISTING, # Client opens an existing pipe
+                            0,
+                            None)
+                        logging.info(f"Successfully connected to Windows pipe: {pipe_name}")
+                        connected = True
+                        break # Connected, exit retry loop
+                    except pywintypes.error as e:
+                        if e.winerror == 2: # ERROR_FILE_NOT_FOUND
+                            logging.warning(f"Pipe '{pipe_name}' not found (Attempt {attempt + 1}). Retrying in {connect_attempt_delay}s...")
+                            if attempt < max_connect_attempts - 1:
+                                time.sleep(connect_attempt_delay)
+                            else:
+                                logging.error(f"Failed to connect to pipe {pipe_name} after {max_connect_attempts} attempts. Ensure the writer script (PhotonGPT.py) is running and has created the pipe.")
+                                # Let this error propagate to the outer try/except for the 5s sleep
+                                raise  
+                        elif e.winerror == 231: # ERROR_PIPE_BUSY
+                             logging.warning(f"Pipe '{pipe_name}' is busy (Attempt {attempt + 1}). Retrying in {connect_attempt_delay}s...")
+                             if attempt < max_connect_attempts - 1:
+                                time.sleep(connect_attempt_delay)
+                             else:
+                                logging.error(f"Pipe {pipe_name} remained busy after {max_connect_attempts} attempts.")
+                                raise
+                        else:
+                            logging.error(f"Windows API error when trying to open pipe: {e}")
+                            raise # Re-raise other pywintypes errors
+                    except Exception as e_inner: # Catch other potential errors during CreateFile
+                        logging.error(f"Unexpected error when trying to open pipe: {e_inner}")
+                        raise # Re-raise to outer try-except
+                
+                if not connected or pipe_handle is None:
+                    # If all attempts failed, the 'raise' in the loop would have been hit.
+                    # This is a fallback or if the loop finishes without connecting (should not happen with raise).
+                    # The outer exception handler will catch the re-raised error and sleep for 5 seconds.
+                    logging.error(f"Could not establish connection to pipe {pipe_name}. Will retry main loop.")
+                    # No need to manually sleep here, outer loop's exception handler will.
+                    continue # Go to the next iteration of the outer while loop
+
+                # If connected, proceed to read
+                try:
+                    logging.info(f"Windows pipe connected. Reading data from {pipe_name}...")
+                    while True:
+                        try:
+                            # Read whatever is available, up to a buffer size
+                            hr, chunk = win32file.ReadFile(pipe_handle, 65536) # Read up to 64KB
+                            if hr == 0: # ERROR_SUCCESS (but check if any bytes were read)
+                                if len(chunk) > 0:
+                                    opus_data += chunk
+                                else: 
+                                    # 0 bytes read with ERROR_SUCCESS often means graceful EOF on message pipes
+                                    # or the writer closed its end.
+                                    break 
+                            else:
+                                # This 'else' might not be hit if ReadFile raises pywintypes.error on failure
+                                logging.warning(f"ReadFile returned hr={hr}. Breaking read loop.")
+                                break
+                        except pywintypes.error as e:
+                            if e.winerror == 109: # ERROR_BROKEN_PIPE (writer closed pipe after sending all data)
+                                logging.info("Broken pipe (ERROR_BROKEN_PIPE) - writer likely closed connection.")
+                                break 
+                            elif e.winerror == 232: # ERROR_NO_DATA (The pipe is being closed)
+                                logging.info("Pipe is being closed (ERROR_NO_DATA).")
+                                break
+                            # Add other specific error codes if needed
+                            logging.error(f"Windows API error during ReadFile: {e}")
+                            raise # Propagate other errors
+                finally:
+                    if pipe_handle:
+                        win32file.CloseHandle(pipe_handle)
+                        pipe_handle = None # Clear handle
+                    logging.info(f"Windows pipe {pipe_name} session ended.")
+            
+            else: # For Linux/macOS
+                logging.info(f"Opening Unix pipe '{pipe_path}' for reading...")
+                # This will block until the writer opens its end
+                with open(pipe_path, "rb") as pipe_file_obj:
+                    opus_data = pipe_file_obj.read() # Read entire content once writer closes its end
+                logging.info(f"Unix pipe closed after reading {len(opus_data)} bytes.")
+
+            if opus_data:
+                logging.info(f"Successfully read {len(opus_data)} bytes from pipe.")
+                processing_thread = threading.Thread(
+                    target=process_pipe_stream,
+                    args=(opus_data, avatar_instance, fps),
+                    daemon=True
+                )
+                processing_thread.start()
             else:
-                # If debounce time has passed since last event, process immediately
-                setattr(self, '_last_event_time', current_time)
-                self.check_and_process(current_time)
+                logging.info("Read 0 bytes from pipe. Waiting for new data.")
+                # No need to sleep excessively here if the pipe open/read is blocking appropriately.
+                # If the pipe was opened and closed immediately by the writer with no data,
+                # this is normal. The loop will try to open it again.
+                # A small delay can prevent very rapid open/close cycles if something is misbehaving.
+                time.sleep(0.1) 
+
+        except FileNotFoundError: # This applies more to Unix if the pipe file itself is gone
+            logging.error(f"Pipe file '{pipe_path}' not found. Ensure PhotonGPT.py is running and creates the pipe.")
+            time.sleep(5) 
+        except pywintypes.error as e: # Catch errors propagated from the connection attempt
+            logging.error(f"Windows Pipe Connection/Read Error (will retry): {e}")
+            time.sleep(5) # Main retry interval for persistent failures
+        except Exception as e:
+            logging.error(f"An unexpected error occurred in the pipe listener loop:")
+            logging.error(traceback.format_exc())
+            time.sleep(5) # Main retry interval
+        finally:
+            if pipe_handle: # Ensure handle is closed if an exception occurred after open but before finally
+                try:
+                    win32file.CloseHandle(pipe_handle)
+                except Exception as e_close:
+                    logging.error(f"Error closing lingering pipe_handle in outer finally: {e_close}")
 
 
-    def check_and_process(self, event_time_to_match):
-         """ Check if the latest event time matches the one that triggered this check, then process """
-         # Ensure we process only based on the *last* modification within the debounce window
-         if getattr(self, '_last_event_time', 0) == event_time_to_match:
-             logging.info(f"Debounce period ended. Triggering processing for {self.target_file_path}")
-             # Run processing in a separate thread to avoid blocking the observer/timer
-             thread = threading.Thread(target=self.process_wav, daemon=True)
-             thread.start()
-         else:
-              logging.debug("Skipping scheduled check - newer modification event occurred.")
+# ... (The rest of your script: process_pipe_stream, if __name__ == "__main__" block with config loading and Avatar instantiation)
 
-
-# --- Main Execution (Watcher Setup) ---
 if __name__ == "__main__":
-    logging.info("Starting Realtime Stream Sync Watcher...")
+    logging.info("Starting Realtime Stream Sync from Pipe...")
 
     # --- Validate Configuration ---
-    if not WATCHED_WAV_FILE_PATH:
-        logging.error("❌ Error: WATCHED_WAV_FILE_PATH not set in .env file.")
+    if not STREAM_PIPE_PATH:
+        logging.error("❌ Error: STREAM_PIPE_PATH not set in .env file.")
         sys.exit(1)
-    if not os.path.isabs(WATCHED_WAV_FILE_PATH):
-         # Attempt to make it absolute based on current dir, but log a warning
-         abs_path = os.path.abspath(WATCHED_WAV_FILE_PATH)
-         logging.warning(f"⚠️ WATCHED_WAV_FILE_PATH is not absolute. Assuming path relative to script: {abs_path}")
-         WATCHED_WAV_FILE_PATH = abs_path
-         # Better: require absolute path in .env
-         # logging.error("❌ Error: WATCHED_WAV_FILE_PATH must be an absolute path in .env file.")
-         # sys.exit(1)
+    # ... (rest of your config validation, Avatar instantiation) ...
+    # Ensure main_avatar is instantiated correctly before this call:
 
-    if not AVATAR_CONFIG_PATH or not os.path.exists(AVATAR_CONFIG_PATH):
-        logging.error(f"❌ Error: AVATAR_CONFIG_PATH '{AVATAR_CONFIG_PATH}' not found or not set in .env.")
-        sys.exit(1)
-    if not AVATAR_ID_TO_USE:
-        logging.error("❌ Error: AVATAR_ID_TO_USE not set in .env file.")
-        sys.exit(1)
-
-    watch_directory = os.path.dirname(WATCHED_WAV_FILE_PATH)
-    if not os.path.isdir(watch_directory):
-        logging.error(f"❌ Error: Directory '{watch_directory}' derived from WATCHED_WAV_FILE_PATH does not exist.")
-        sys.exit(1)
-
-    # --- Load Avatar Config ---
+    # --- Instantiate the Avatar (Ensure this part is correct from your original) ---
+    main_avatar = None # Initialize
     try:
+        # (Your existing code to load AVATAR_CONFIG_PATH, AVATAR_ID_TO_USE)
+        # (Your existing code to get video_path, bbox_shift, preparation, batch_size from avatar_config)
+        
+        # Example structure (replace with your actual avatar instantiation logic)
         inference_config_all = OmegaConf.load(AVATAR_CONFIG_PATH)
         if AVATAR_ID_TO_USE not in inference_config_all:
             logging.error(f"❌ Error: Avatar ID '{AVATAR_ID_TO_USE}' not found in config file '{AVATAR_CONFIG_PATH}'.")
@@ -794,26 +851,17 @@ if __name__ == "__main__":
             sys.exit(1)
         avatar_config = inference_config_all[AVATAR_ID_TO_USE]
         logging.info(f"Loaded config for Avatar ID: {AVATAR_ID_TO_USE}")
-    except Exception as e_conf:
-        logging.error(f"❌ Error loading avatar config file '{AVATAR_CONFIG_PATH}': {e_conf}")
-        sys.exit(1)
 
-    # --- Instantiate the Avatar ---
-    try:
-        # Get necessary params from the specific avatar's config
         video_path = avatar_config.get("video_path")
         bbox_shift = avatar_config.get("bbox_shift", 0)
-        preparation = avatar_config.get("preparation", False) # Default to False if not specified
+        preparation = avatar_config.get("preparation", False)
+        batch_size = avatar_config.get("batch_size", 4) # Or from your config
 
         if not video_path:
-             logging.error(f"❌ Error: 'video_path' not defined for avatar '{AVATAR_ID_TO_USE}' in config.")
-             sys.exit(1)
-
-        # Determine batch_size (example: fixed or from config/args if needed later)
-        batch_size = 4 # Or load from config if available: avatar_config.get("batch_size", 4)
+            logging.error(f"❌ Error: 'video_path' not defined for avatar '{AVATAR_ID_TO_USE}' in config.")
+            sys.exit(1)
 
         logging.info("Instantiating Avatar object...")
-        # Pass batch_size to Avatar constructor if needed
         main_avatar = Avatar(
             avatar_id=AVATAR_ID_TO_USE,
             video_path=video_path,
@@ -831,26 +879,14 @@ if __name__ == "__main__":
         logging.error(traceback.format_exc())
         sys.exit(1)
 
-    # --- Setup Watchdog ---
-    event_handler = WavFileHandler(WATCHED_WAV_FILE_PATH, main_avatar, TARGET_FPS)
-    observer = Observer()
-    observer.schedule(event_handler, watch_directory, recursive=False)
+    if main_avatar is None:
+        logging.critical("❌ Avatar could not be initialized. Exiting.")
+        sys.exit(1)
 
-    # --- Start Observer ---
-    observer.start()
-    logging.info(f"👀 Watcher started for directory: {watch_directory}")
-    logging.info(f"👂 Listening for changes to: {WATCHED_WAV_FILE_PATH}")
-    logging.info("🚀 Ready to process detected WAV file changes.")
-    logging.info("Press Ctrl+C to stop.")
-
+    # --- Start the Pipe Listener ---
     try:
-        while True:
-            time.sleep(1)
+        main_pipe_listener(STREAM_PIPE_PATH, main_avatar, TARGET_FPS)
     except KeyboardInterrupt:
-        logging.info("🛑 KeyboardInterrupt received. Stopping observer...")
-    except Exception as e:
-         logging.error(f"An unexpected error occurred in main loop: {e}")
+        logging.info("🛑 KeyboardInterrupt received. Shutting down.")
     finally:
-        observer.stop()
-        observer.join()
-        logging.info("✅ Watcher stopped cleanly.")
+        logging.info("✅ Application finished.")
