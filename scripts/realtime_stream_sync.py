@@ -52,6 +52,11 @@ load_dotenv()
 STREAM_PIPE_PATH = os.getenv("STREAM_PIPE_PATH")
 AVATAR_CONFIG_PATH = os.getenv("AVATAR_CONFIG_PATH", "configs/inference/realtime.yaml")
 AVATAR_ID_TO_USE = os.getenv("AVATAR_ID_TO_USE")
+# Add near the top with other environment vars
+FRAME_SKIP_THRESHOLD = int(os.getenv("FRAME_SKIP_THRESHOLD", "3"))
+OVERLOAD_MULTIPLIER = float(os.getenv("OVERLOAD_MULTIPLIER", "1.2"))
+MAX_FRAMES_TO_SKIP = int(os.getenv("MAX_FRAMES_TO_SKIP", "1"))
+
 try:
     TARGET_FPS = int(os.getenv("TARGET_FPS", "25"))
 except ValueError:
@@ -209,7 +214,7 @@ class GStreamerPipeline:
         # Adjusted pipeline for potentially better compatibility and performance
         pipeline_str_fdsrc = (
             f"fdsrc fd=0 ! videoparse format=bgr width={self.width} height={self.height} framerate={self.fps}/1 ! "
-            "queue leaky=downstream max-size-buffers=5 ! videoconvert ! " # Added leaky queue
+            "queue leaky=downstream max-size-buffers=5 ! videoconvert ! videorate !" # Added leaky queue
             f"video/x-raw,format=NV12,width={self.width},height={self.height},framerate={self.fps}/1 ! queue max-size-buffers=5 ! "
             f"nvh265enc preset=low-latency-hq rc-mode=cbr bitrate=4000 gop-size=30 ! " # bitrate=8000 for 8 Mbps
             "h265parse ! rtph265pay config-interval=1 ! "
@@ -291,11 +296,16 @@ class GStreamerAudio:
         self.sample_rate = sample_rate; self.channels = channels
         # Using opusenc for encoding
         pipeline_str = (
-           f"fdsrc fd=0 do-timestamp=true ! audio/x-raw,format=S16LE,channels={self.channels},rate={self.sample_rate},layout=interleaved ! "
-            "queue leaky=downstream max-size-buffers=30 max-size-time=1500000000 ! audioconvert ! audioresample ! " # 1.5 second buffer, leaky
-            "opusenc bitrate=64000 complexity=2 frame-size=20 ! rtpopuspay pt=97 ! "
-            f"udpsink host={self.host} port={self.port} sync=false async=false"
-        )
+           f"fdsrc fd=0 ! "
+            # 1. Input Queue: A large, non-leaky buffer right at the start.
+            # This absorbs the raw audio bytes from Python immediately, even if the rest of the pipeline stalls.
+            "queue  max-size-time=3000000000  leaky=no ! "
+            f"audio/x-raw,format=S16LE,channels={self.channels},rate={self.sample_rate},layout=interleaved ! "
+            "audioconvert ! audioresample ! "
+            "opusenc bitrate=96000 ! "
+            "rtpopuspay ! "
+            f"udpsink host={self.host} port={self.port} sync=false"
+                )
         logging.info(f"Attempting to start GStreamer audio pipeline: {pipeline_str}")
         try:
             self.process = subprocess.Popen(f"gst-launch-1.0 -v {pipeline_str}", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, bufsize=0)
@@ -631,6 +641,7 @@ class Avatar: # NO @torch.no_grad() here
             if full_audio_pcm is None or full_audio_pcm.size == 0:
                 raise ValueError(f"[{run_id}] PCM audio is empty after FFmpeg read.")
             
+            
             actual_total_audio_samples = len(full_audio_pcm)
 
             # VVVVVVVVVVVVVVVVVVVV NEW A/V DURATION SYNC LOGIC VVVVVVVVVVVVVVVVVVVV
@@ -734,13 +745,24 @@ class Avatar: # NO @torch.no_grad() here
             logging.info(f"{YELLOW}{summary_string}{RESET_COLOR}")
             logging.info(f">>> Avatar.inference method finished for {run_id}.")
 
+    
+
     def process_frames(self, res_frame_q, video_len_in_batches, gst_video_pipeline, gst_audio_pipeline, skip_save_images, target_fps):
         cpu_cores = os.cpu_count() or 4 
-        num_workers = max(1, cpu_cores // 2, 4)
+        #num_workers = max(1, cpu_cores // 2, 4)
+        num_workers = max(1, cpu_cores - 1)  # Use more CPU cores for processing
 
-        # Ensure a run_id or similar identifier for logging if desired, e.g. from self.avatar_id
+        # --- Variables for frame skipping ---
+        target_frame_time = 1.0 / target_fps if target_fps > 0 else 0.05
+        system_overloaded = False
+        consecutive_overloads = 0
+        skip_frames_threshold = FRAME_SKIP_THRESHOLD
+        overload_multiplier = OVERLOAD_MULTIPLIER
+        max_frames_to_skip = MAX_FRAMES_TO_SKIP
+
+        # Ensure a run_id for logging
         run_id_logging_prefix = f"[{self.avatar_id} PrcFrames]" 
-        logging.info(f"{run_id_logging_prefix} Started with {num_workers} workers for {video_len_in_batches} VAE batches.")
+        logging.info(f"{run_id_logging_prefix} Started with {num_workers} workers, skip threshold: {skip_frames_threshold}, multiplier: {overload_multiplier}")
 
         required_lists = [
             self.coord_list_cycle, self.frame_list_cycle,
@@ -754,31 +776,52 @@ class Avatar: # NO @torch.no_grad() here
 
         processed_vae_batch_count = 0
         total_frames_sent_to_gstreamer = 0
-        expected_total_video_frames = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             while processed_vae_batch_count < video_len_in_batches:
+                batch_start_time = time.time()
+                
+                # --- Simplified frame skipping logic ---
+                if system_overloaded and consecutive_overloads >= skip_frames_threshold:
+                    try:
+                        # Skip one batch when overloaded
+                        batch_tuple = res_frame_q.get(block=False)
+                        if batch_tuple is not None:  # Not the sentinel
+                            logging.warning(f"{run_id_logging_prefix} System overloaded! Skipping one batch to catch up.")
+                            res_frame_q.task_done()
+                            processed_vae_batch_count += 1
+                            consecutive_overloads = max(0, consecutive_overloads - 1)  # Reduce overload count
+                            continue
+                    except queue.Empty:
+                        pass  # If queue is empty, proceed normally
+                
                 try:
                     batch_tuple = res_frame_q.get(block=True, timeout=10.0)
                 except queue.Empty:
                     logging.warning(f"{run_id_logging_prefix} Timeout on res_frame_q. Processed {processed_vae_batch_count}/{video_len_in_batches}.")
-                    if processed_vae_batch_count > 0 : break
-                    else: continue
+                    if processed_vae_batch_count > 0:
+                        break
+                    else:
+                        continue
                 
                 if batch_tuple is None: 
                     logging.info(f"{run_id_logging_prefix} Got None sentinel. Ending process_frames.")
                     break
                 
-                if not isinstance(batch_tuple, tuple) or len(batch_tuple)!=2: 
-                    logging.warning(f"{run_id_logging_prefix} Invalid data from res_frame_q. Skip."); res_frame_q.task_done(); continue
+                if not isinstance(batch_tuple, tuple) or len(batch_tuple) != 2: 
+                    logging.warning(f"{run_id_logging_prefix} Invalid data from res_frame_q. Skipping batch.")
+                    res_frame_q.task_done()
+                    continue
                 
                 vae_output_frames, audio_pcm_chunk_for_gstreamer = batch_tuple
 
                 if not vae_output_frames or not isinstance(vae_output_frames, list):
-                    logging.warning(f"{run_id_logging_prefix} Invalid VAE frames. Skip batch."); res_frame_q.task_done(); processed_vae_batch_count+=1; continue
+                    logging.warning(f"{run_id_logging_prefix} Invalid VAE frames. Skipping batch.")
+                    res_frame_q.task_done()
+                    processed_vae_batch_count += 1
+                    continue
                 
                 num_frames_in_this_vae_batch = len(vae_output_frames)
-                expected_total_video_frames += num_frames_in_this_vae_batch
                 
                 args_for_map = [
                     (i, self.idx, vae_output_frames[i], gst_video_pipeline.width, gst_video_pipeline.height)
@@ -787,31 +830,51 @@ class Avatar: # NO @torch.no_grad() here
                 
                 final_blended_frames_for_gstreamer = [None] * num_frames_in_this_vae_batch
                 try:
-                    for i_map, blended_frame_map in executor.map(self.process_single_frame_parallel, args_for_map): # Call as method
-                        if blended_frame_map is not None: final_blended_frames_for_gstreamer[i_map] = blended_frame_map
-                        else: logging.warning(f"{run_id_logging_prefix} Blending returned None for frame {i_map} of VAE batch {processed_vae_batch_count}.")
+                    for i_map, blended_frame_map in executor.map(self.process_single_frame_parallel, args_for_map):
+                        if blended_frame_map is not None:
+                            final_blended_frames_for_gstreamer[i_map] = blended_frame_map
+                        else:
+                            logging.warning(f"{run_id_logging_prefix} Blending returned None for frame {i_map} of VAE batch {processed_vae_batch_count}.")
                 except Exception as e_map_exc: 
-                    logging.error(f"{run_id_logging_prefix} Error in parallel blending batch {processed_vae_batch_count}: {e_map_exc}"); traceback.print_exc()
-                    res_frame_q.task_done(); processed_vae_batch_count+=1; self.idx = (self.idx + num_frames_in_this_vae_batch)%len(self.coord_list_cycle); continue
+                    logging.error(f"{run_id_logging_prefix} Error in parallel blending batch {processed_vae_batch_count}: {e_map_exc}")
+                    traceback.print_exc()
+                    res_frame_q.task_done()
+                    processed_vae_batch_count += 1
+                    self.idx = (self.idx + num_frames_in_this_vae_batch) % len(self.coord_list_cycle)
+                    continue
                 
                 valid_blended_frames = [f for f in final_blended_frames_for_gstreamer if f is not None]
                 frames_sent_iter = 0
                 if valid_blended_frames:
                     for frame_send in valid_blended_frames:
-                        if gst_video_pipeline.send_frame(frame_send): frames_sent_iter += 1
-                        else: logging.error(f"{run_id_logging_prefix} Failed send video to GStreamer. Stop video for this segment."); break
+                        if gst_video_pipeline.send_frame(frame_send):
+                            frames_sent_iter += 1
+                        else:
+                            logging.error(f"{run_id_logging_prefix} Failed to send video to GStreamer. Stopping video for this segment.")
+                            break
                     total_frames_sent_to_gstreamer += frames_sent_iter
                     if frames_sent_iter > 0 and audio_pcm_chunk_for_gstreamer is not None and audio_pcm_chunk_for_gstreamer.size > 0:
-                        if not gst_audio_pipeline.send_audio(audio_pcm_chunk_for_gstreamer): logging.error(f"{run_id_logging_prefix} Failed send audio to GStreamer.")
-                    elif frames_sent_iter == 0 and audio_pcm_chunk_for_gstreamer is not None and audio_pcm_chunk_for_gstreamer.size > 0: 
-                        logging.warning(f"{run_id_logging_prefix} No video sent, audio chunk skipped.")
-                else: 
+                        if not gst_audio_pipeline.send_audio(audio_pcm_chunk_for_gstreamer):
+                            logging.error(f"{run_id_logging_prefix} Failed to send audio to GStreamer.")
+                else:
                     logging.warning(f"{run_id_logging_prefix} No valid blended frames for batch {processed_vae_batch_count}.")
-                    if audio_pcm_chunk_for_gstreamer is not None and audio_pcm_chunk_for_gstreamer.size > 0:
-                         logging.warning(f"{run_id_logging_prefix} Audio chunk for this batch also skipped as no video was sent.")
                 
                 self.idx = (self.idx + num_frames_in_this_vae_batch) % len(self.coord_list_cycle)
-                res_frame_q.task_done(); processed_vae_batch_count += 1
+                res_frame_q.task_done()
+                processed_vae_batch_count += 1
+                
+                # --- Performance measurement ---
+                batch_processing_time = time.time() - batch_start_time
+                system_overloaded = batch_processing_time > (target_frame_time * num_frames_in_this_vae_batch * overload_multiplier)
+                
+                if system_overloaded:
+                    consecutive_overloads += 1
+                    logging.warning(f"System struggling to keep up! Batch took {batch_processing_time:.3f}s " +
+                                    f"(target: {target_frame_time * num_frames_in_this_vae_batch:.3f}s). " +
+                                    f"Overload count: {consecutive_overloads}/{skip_frames_threshold}")
+                else:
+                    consecutive_overloads = max(0, consecutive_overloads - 1)  # Gradually reduce overload counter
+                
         logging.info(f"--- {run_id_logging_prefix} Avatar.process_frames finished. Processed {processed_vae_batch_count} VAE batches. Sent {total_frames_sent_to_gstreamer} frames to GStreamer. ---")
 
     # This method MUST be part of the Avatar class and correctly indented
@@ -957,89 +1020,54 @@ def process_pipe_stream(opus_data_segment, avatar_instance_ref, target_fps_ref):
 
 def main_pipe_listener(pipe_path, avatar_instance_unused, fps_unused, opus_input_q_ref):
     """
-    Continuously listens to the named pipe for audio data and puts it into opus_input_q_ref.
-    It will poll less aggressively when an inference task is already in progress.
+    Continuously monitors the specified file path for new audio data.
+    When the file is updated, it reads the content and puts it into the processing queue.
     """
-    logging.info(f"🚀 Starting pipe listener thread...")
-    logging.info(f"👂 Listening for audio stream on pipe: {pipe_path}")
+    logging.info(f"🚀 Starting file watcher thread for: {pipe_path}")
+    last_played_mtime = 0  # Modification time of the last file processed
 
     while True:
-        # VVVVVVVVVVVVVVVVVVVV NEW LOGIC VVVVVVVVVVVVVVVVVVVV
-        # If an inference is busy, sleep for a longer, non-intensive interval
-        # before trying to connect. This reduces CPU/GIL contention.
-        if inference_lock.locked():
-            time.sleep(0.5) # Sleep for 500ms and check the lock again
-            continue # Go to the start of the while loop to re-check the lock
-        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-        # If the lock is NOT held, we proceed with aggressive polling to be responsive.
-        pipe_handle = None
-        connected_this_cycle = False
         try:
-            opus_data_for_current_message = b''
-            if sys.platform == "win32":
-                pipe_name = r'\\.\pipe\\' + os.path.basename(pipe_path)
-                # We can reduce attempts here since we check the lock first
-                max_connect_attempts = 5
-                connect_attempt_delay = 0.1 # Shorter delay between responsive polls
+            # Poll less aggressively if an inference is busy to save CPU
+            if inference_lock.locked():
+                time.sleep(0.5)
+                continue
 
-                for attempt in range(max_connect_attempts):
-                    try:
-                        # Since we only get here when inference isn't running, we can be more verbose
-                        logging.debug(f"Attempting to connect to Windows pipe: {pipe_name} (Attempt {attempt + 1}/{max_connect_attempts})")
-                        pipe_handle = win32file.CreateFile(
-                            pipe_name,
-                            win32file.GENERIC_READ,
-                            win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
-                            None, win32file.OPEN_EXISTING, 0, None
-                        )
-                        logging.info(f"Successfully connected to Windows pipe: {pipe_name}")
-                        connected_this_cycle = True
-                        break
-                    except pywintypes.error as e:
-                        if e.winerror == 2: # ERROR_FILE_NOT_FOUND
-                            if attempt < max_connect_attempts - 1:
-                                time.sleep(connect_attempt_delay)
-                            else: # After all attempts fail, the outer loop will trigger a longer sleep.
-                                logging.debug(f"Pipe not found after {max_connect_attempts} attempts. Will wait.")
-                        else:
-                            logging.warning(f"Windows API error on connect attempt: {e}")
-                            time.sleep(1) # Wait a bit on other errors
-                
-                # If we are connected, read the data from the pipe
-                if connected_this_cycle and pipe_handle:
-                    logging.info(f"Windows pipe connected. Reading data...")
-                    while True:
-                        try:
-                            hr, chunk = win32file.ReadFile(pipe_handle, 131072)
-                            if len(chunk) > 0:
-                                opus_data_for_current_message += chunk
-                            if hr == 0 and len(chunk) == 0: # Graceful close
-                                break
-                        except pywintypes.error as e_read:
-                            if e_read.winerror == 109: # Broken pipe is normal EOF here
-                                logging.info(f"Broken pipe on {pipe_name} - writer closed connection.")
-                            else: logging.warning(f"Error reading from pipe: {e_read}")
-                            break
-                    # The finally block will close the handle
-            # ... (your existing Linux/macOS logic remains the same) ...
-            
-            # --- Data Queuing Logic ---
-            if opus_data_for_current_message:
-                logging.info(f"Pipe listener successfully read {len(opus_data_for_current_message)} bytes. Queuing for processing.")
-                try:
-                    # This put will block until the inference_worker's queue has space, which is fine.
-                    opus_input_q_ref.put(opus_data_for_current_message) 
-                except Exception as e_queue:
-                    logging.error(f"Failed to put data into queue: {e_queue}")
+            # Check if the target file exists
+            if os.path.isfile(pipe_path):
+                current_mtime = os.path.getmtime(pipe_path)
 
-        except Exception as e_outer:
-            logging.error(f"Pipe listener loop error: {e_outer}")
-            time.sleep(2) # Sleep on major errors before retrying
-        finally:
-            if pipe_handle:
-                try: win32file.CloseHandle(pipe_handle)
-                except Exception: pass
+                # If the file's modification time is newer, it's a new audio segment
+                if current_mtime > last_played_mtime:
+                    logging.info(f"New audio file detected at '{pipe_path}'. Reading content.")
+
+                    # Read the entire content of the new audio file
+                    with open(pipe_path, "rb") as f:
+                        opus_data_segment = f.read()
+
+                    if opus_data_segment:
+                        # Put the data into the queue for the inference_worker to process
+                        opus_input_q_ref.put(opus_data_segment)
+                        # Update the last modification time so we don't process this file again
+                        last_played_mtime = current_mtime
+                    else:
+                        logging.warning(f"Detected new file modification, but file '{pipe_path}' was empty.")
+                        # Still update time to avoid re-reading an empty file
+                        last_played_mtime = current_mtime
+            else:
+                # If the file doesn't exist, just wait briefly.
+                time.sleep(0.2) 
+
+        except FileNotFoundError:
+            # This can happen if the file is deleted between os.path.isfile and os.path.getmtime.
+            # It's safe to ignore and continue the loop.
+            logging.debug("File not found during check, it may have been deleted. Continuing to watch.")
+            last_played_mtime = 0 # Reset in case a new file is created with the same name
+            time.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Error in file listener loop: {e}")
+            logging.error(traceback.format_exc())
+            time.sleep(2) # Sleep longer on unexpected errors
 
 # <<<<<<<<<<<<<<<< NEW: Worker Function Definition <<<<<<<<<<<<<<<<
 def inference_worker(avatar_instance_ref, target_fps_ref, opus_q_ref):
