@@ -4,8 +4,8 @@
 .vscode/
 *.pyc
 .ipynb_checkpoints
-models
 results/
+<<<<<<< HEAD
 data/audio/*.wav
 data/video/*.mp4
 data/video/*.mov
@@ -21,3 +21,16 @@ ffmpeg-release-amd64-static.tar.xz
 musetalk.zip
 scripts.zip
 venv_PhotonSync/
+=======
+models/
+**/__pycache__/
+*.py[cod]
+*$py.class
+dataset/
+ffmpeg*
+ffmprobe*
+ffplay*
+debug
+exp_out
+.gradio
+>>>>>>> main
