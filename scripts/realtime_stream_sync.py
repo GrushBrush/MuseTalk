@@ -144,41 +144,72 @@ class FFmpegAudioReader:
 # --- GStreamer Classes ---
 class GStreamerPipeline:
     """Manages the GStreamer video pipeline subprocess."""
-    def __init__(self, width=720, height=1280, fps=25, host="127.0.0.1", port=5000):
+    def __init__(self, width=1280, height=720, fps=TARGET_FPS, host="127.0.0.1", port=5000):
         self.width, self.height, self.fps, self.host, self.port = width, height, fps, host, port
         self.process = None
-        # A more robust pipeline with leaky queues to handle backpressure and nvenc for performance
+        self.stdout_thread = None
+        self.stderr_thread = None
+
+        # A robust pipeline with leaky queues (for backpressure) and nvenc for performance
         pipeline_str = (
             f"fdsrc fd=0 do-timestamp=true is-live=true ! videoparse format=bgr width={self.width} height={self.height} framerate={self.fps}/1 ! "
             "queue ! videoconvert ! videorate ! "
-            f"video/x-raw,format=NV12 ! "
+            f"video/x-raw,format=NV12 ! " # Assuming NV12 is desired for nvh265enc
             "queue ! "
+            # Reverting bitrate to 4000 as per your old working code, and keep preset for testing
             f"nvh265enc preset=low-latency-hq rc-mode=cbr bitrate=4000 gop-size=30 ! "
             "h265parse ! rtph265pay pt=96 config-interval=1 ! "
             f"udpsink host={self.host} port={self.port} sync=true async=false"
         )
-        logging.info(f"Starting GStreamer video pipeline...")
+        logging.info(f"Starting GStreamer video pipeline with resolution {self.width}x{self.height}@{self.fps}fps...")
+        
+        # Prepare environment variables for the subprocess
+        env_vars = os.environ.copy()
+        env_vars['GST_DEBUG'] = '3' # Set GStreamer debug level
+
         try:
-            # Using bufsize=0 for unbuffered stdin writes
-            self.process = subprocess.Popen(f"gst-launch-1.0 -v {pipeline_str}", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, bufsize=0)
+            # Construct the command string without explicit quoting for GSTREAMER_LAUNCH_PATH here.
+            # This relies on the shell's PATH to find gst-launch-1.0.
+            # If GSTREAMER_LAUNCH_PATH itself has a full path, this will override PATH.
+            command_to_run = f"{GSTREAMER_LAUNCH_PATH} -v {pipeline_str}"
+
+            logging.debug(f"DEBUG: GStreamer VIDEO command (old way): {command_to_run}")
+
+            self.process = subprocess.Popen(
+                command_to_run,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, # Capture stdout
+                stderr=subprocess.PIPE, # Capture stderr
+                shell=True, # Keep shell=True
+                bufsize=0,
+                env=env_vars
+            )
             logging.info(f"✅ GStreamer video process launched (PID: {self.process.pid}).")
-            # Start threads to log GStreamer's output for debugging
-            threading.Thread(target=self._log_stream, args=(self.process.stderr, "GST_VID_ERR"), daemon=True).start()
+
+            # --- Start threads to read stdout and stderr asynchronously ---
+            self.stdout_thread = threading.Thread(
+                target=_log_subprocess_output,
+                args=(self.process.stdout, logging.info, "GST_VIDEO_STDOUT"),
+                daemon=True
+            )
+            self.stderr_thread = threading.Thread(
+                target=_log_subprocess_output,
+                args=(self.process.stderr, logging.error, "GST_VIDEO_STDERR"),
+                daemon=True
+            )
+            self.stdout_thread.start()
+            self.stderr_thread.start()
+
         except Exception as e:
             logging.error(f"❌ Failed to start GStreamer video pipeline: {e}", exc_info=True)
-
-    def _log_stream(self, stream, prefix):
-        try:
-            for line_bytes in iter(stream.readline, b''):
-                logging.info(f"[{prefix}]: {line_bytes.decode(errors='ignore').strip()}")
-        finally:
-            stream.close()
+            self.process = None 
 
     def send_frame(self, frame):
+        """Sends a NumPy array frame to the GStreamer pipeline's stdin."""
         if not self.process or self.process.stdin.closed:
+            logging.error("❌ GStreamer video pipeline process is not running or stdin is closed.")
             return False
         try:
-            # Ensure frame data is contiguous in memory before writing
             if not frame.flags['C_CONTIGUOUS']:
                 frame = np.ascontiguousarray(frame, dtype=np.uint8)
             self.process.stdin.write(frame.tobytes())
@@ -193,6 +224,7 @@ class GStreamerPipeline:
             return False
 
     def stop(self):
+        """Stops the GStreamer video subprocess gracefully."""
         if self.process:
             logging.info(f"Stopping GStreamer video pipeline (PID: {self.process.pid})...")
             proc_to_stop, self.process = self.process, None
@@ -201,11 +233,19 @@ class GStreamerPipeline:
                 except Exception: pass
             proc_to_stop.terminate()
             try:
-                proc_to_stop.wait(timeout=2)
+                proc_to_stop.wait(timeout=3)
                 logging.info(f"✅ GStreamer video process terminated.")
             except subprocess.TimeoutExpired:
                 logging.warning(f"⚠️ GStreamer video process did not terminate gracefully, killing...")
                 proc_to_stop.kill()
+
+        if self.stdout_thread and self.stdout_thread.is_alive():
+            logging.info("Joining GST_VIDEO_STDOUT thread...")
+            self.stdout_thread.join(timeout=1)
+        if self.stderr_thread and self.stderr_thread.is_alive():
+            logging.info("Joining GST_VIDEO_STDERR thread...")
+            self.stderr_thread.join(timeout=1)
+        logging.info("GStreamer video pipeline stop complete.")
 
 
 class GStreamerAudio:
@@ -213,6 +253,9 @@ class GStreamerAudio:
     def __init__(self, host="127.0.0.1", port=5001, sample_rate=48000, channels=2):
         self.host, self.port, self.sample_rate, self.channels = host, port, sample_rate, channels
         self.process = None
+        self.stdout_thread = None
+        self.stderr_thread = None
+
         pipeline_str = (
             f"fdsrc fd=0 do-timestamp=true is-live=true ! "
             "queue ! "
@@ -222,12 +265,86 @@ class GStreamerAudio:
             f"udpsink host={self.host} port={self.port} sync=true"
         )
         logging.info("Starting GStreamer audio pipeline...")
+
+        env_vars = os.environ.copy()
+        env_vars['GST_DEBUG'] = '3'
+        
         try:
-            self.process = subprocess.Popen(f"gst-launch-1.0 -v {pipeline_str}", stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, bufsize=0)
+            # Construct the command string without explicit quoting for GSTREAMER_LAUNCH_PATH here.
+            command_to_run = f"{GSTREAMER_LAUNCH_PATH} -v {pipeline_str}"
+
+            logging.debug(f"DEBUG: GStreamer AUDIO command (old way): {command_to_run}")
+
+            self.process = subprocess.Popen(
+                command_to_run,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True,
+                bufsize=0,
+                env=env_vars
+            )
             logging.info(f"✅ GStreamer audio process launched (PID: {self.process.pid}).")
-            threading.Thread(target=self._log_stream, args=(self.process.stderr, "GST_AUD_ERR"), daemon=True).start()
+
+            # --- Start threads to read stdout and stderr asynchronously ---
+            self.stdout_thread = threading.Thread(
+                target=_log_subprocess_output,
+                args=(self.process.stdout, logging.info, "GST_AUDIO_STDOUT"),
+                daemon=True
+            )
+            self.stderr_thread = threading.Thread(
+                target=_log_subprocess_output,
+                args=(self.process.stderr, logging.error, "GST_AUDIO_STDERR"),
+                daemon=True
+            )
+            self.stdout_thread.start()
+            self.stderr_thread.start()
+
         except Exception as e:
             logging.error(f"❌ Failed to start GStreamer audio pipeline: {e}", exc_info=True)
+            self.process = None
+
+    def send_audio(self, audio_data_pcm):
+        """Sends raw PCM audio data to the GStreamer pipeline's stdin."""
+        if not self.process or self.process.stdin.closed:
+            logging.error("❌ GStreamer audio pipeline process is not running or stdin is closed.")
+            return False
+        try:
+            self.process.stdin.write(audio_data_pcm.tobytes())
+            self.process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            logging.error("❌ GStreamer audio pipeline: Broken pipe.")
+            self.stop()
+            return False
+        except Exception as e:
+            logging.error(f"❌ Error pushing audio chunk: {e}", exc_info=True)
+            return False
+
+    def stop(self):
+        """Stops the GStreamer audio subprocess gracefully."""
+        if self.process:
+            logging.info(f"Stopping GStreamer audio pipeline (PID: {self.process.pid})...")
+            proc_to_stop, self.process = self.process, None
+            if proc_to_stop.stdin and not proc_to_stop.stdin.closed:
+                try: proc_to_stop.stdin.close()
+                except Exception: pass
+            proc_to_stop.terminate()
+            try:
+                proc_to_stop.wait(timeout=3)
+                logging.info("✅ GStreamer audio process terminated.")
+            except subprocess.TimeoutExpired:
+                logging.warning("⚠️ GStreamer audio process did not terminate gracefully, killing...")
+                proc_to_stop.kill()
+
+        if self.stdout_thread and self.stdout_thread.is_alive():
+            logging.info("Joining GST_AUDIO_STDOUT thread...")
+            self.stdout_thread.join(timeout=1)
+        if self.stderr_thread and self.stderr_thread.is_alive():
+            logging.info("Joining GST_AUDIO_STDERR thread...")
+            self.stderr_thread.join(timeout=1)
+        logging.info("GStreamer audio pipeline stop complete.")
+
 
     def _log_stream(self, stream, prefix):
         try:

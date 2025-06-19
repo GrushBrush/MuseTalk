@@ -25,16 +25,6 @@ import queue
 import time
 import subprocess
 
-<<<<<<< HEAD
-# load model weights
-audio_processor, vae, unet, pe = loadz_all_model()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-timesteps = torch.tensor([0], device=device)
-pe = pe.half()
-vae.vae = vae.vae.half()
-unet.model = unet.model.half()
-=======
->>>>>>> main
 
 def fast_check_ffmpeg():
     try:

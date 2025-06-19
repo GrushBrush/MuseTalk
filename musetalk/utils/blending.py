@@ -133,28 +133,4 @@ def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand
 
     blur_kernel_size = int(0.1 * ori_shape[0] // 2 * 2) + 1
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)
-<<<<<<< HEAD
-    return mask_array,crop_box
-
-def get_image_blending(image,face,face_box,mask_array,crop_box):
-    body = image
-    x, y, x1, y1 = face_box
-    x_s, y_s, x_e, y_e = crop_box
-    face_large = body[y_s:y_e, x_s:x_e].copy()
-
-    face_large[y-y_s:y1-y_s, x-x_s:x1-x_s]=face
-
-    # mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
-    if len(mask_array.shape) == 3 and mask_array.shape[2] in [3, 4]:
-        mask_image = cv2.cvtColor(mask_array, cv2.COLOR_BGR2GRAY)
-    else:
-        mask_image = mask_array  # Already grayscale
-
-    mask_image = (mask_image/255).astype(np.float32)
-
-    body[y_s:y_e, x_s:x_e] = cv2.blendLinear(face_large,body[y_s:y_e, x_s:x_e],mask_image,1-mask_image)
-
-    return body
-=======
     return mask_array, crop_box
->>>>>>> main
