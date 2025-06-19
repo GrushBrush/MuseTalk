@@ -25,6 +25,7 @@ from PIL import Image
 import tempfile
 import ffmpeg
 import soundfile as sf # Added for sf.write, assumed to be imported
+import cpuinfo # For detailed CPU information
 
 print("Script started!")
 
@@ -71,21 +72,65 @@ AVATAR_ID_TO_USE = os.getenv("AVATAR_ID_TO_USE", "default_avatar_id")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True) # Add force=True if Python >= 3.8
 print("Logging configured!")
 
-# --- PyTorch Device Setup ---
-# This can be set based on the global GPU_ID derived from .env
+# --- PyTorch Device Setup & System Information Block [CORRECTED] ---
+logging.info("--- System & Hardware Information ---")
+
+# PyTorch Version
+try:
+    torch_version = torch.__version__
+    logging.info(colored(f"PyTorch Version: {torch_version}", 'cyan'))
+except Exception as e:
+    logging.warning(f"Could not determine PyTorch version: {e}")
+
+# CPU Information
+try:
+    cpu_info = cpuinfo.get_cpu_info()
+    cpu_brand = cpu_info.get('brand_raw', 'N/A')
+    cpu_hz = cpu_info.get('hz_actual_friendly', 'N/A')
+    logging.info(colored(f"CPU:             {cpu_brand} @ {cpu_hz}", 'cyan'))
+except Exception as e:
+    logging.warning(f"Could not determine CPU info: {e}")
+
+
+# --- FIX: Define the 'device' object here, before it is used ---
 cuda_available = torch.cuda.is_available()
-device = torch.device(f"cuda:{GPU_ID}" if cuda_available else "cpu")
-logging.info("--- PyTorch Device Information ---")
+if cuda_available:
+    device = torch.device(f"cuda:{GPU_ID}")
+else:
+    device = torch.device("cpu")
+# -------------------------------------------------------------
+
+
+# CUDA and GPU Information
 if cuda_available:
     try:
-        gpu_name = torch.cuda.get_device_name(device)
-        logging.info(f"✅ CUDA (GPU) detected: {gpu_name} (ID: {GPU_ID})")
+        # Get general device properties
+        properties = torch.cuda.get_device_properties(device)
+        gpu_name = properties.name
+        total_vram_gb = properties.total_memory / (1024**3)
+        
+        # Get current memory usage
+        free_vram_bytes, total_vram_bytes = torch.cuda.mem_get_info(device)
+        used_vram_gb = (total_vram_bytes - free_vram_bytes) / (1024**3)
+        available_vram_gb = free_vram_bytes / (1024**3)
+
+        # CUDA Version
+        cuda_version = torch.version.cuda
+        
+        # Log formatted, color-coded information
+        logging.info(colored(f"CUDA Version:    {cuda_version}", 'green'))
+        logging.info(colored(f"GPU:             {gpu_name} (ID: {GPU_ID})", 'green', attrs=['bold']))
+        logging.info(colored(f"VRAM:            {used_vram_gb:.2f} GB Used / {available_vram_gb:.2f} GB Available / {total_vram_gb:.2f} GB Total", 'green'))
+
     except Exception as e:
-        logging.warning(f"⚠️ Could not retrieve GPU name: {e}")
+        logging.warning(colored(f"⚠️ Could not retrieve detailed GPU/CUDA information: {e}", 'yellow'))
 else:
-    logging.info("❌ CUDA (GPU) not available. Using CPU.")
-logging.info(f"✅ Selected device: {device}")
-logging.info("-------------------------------")
+    logging.info(colored("GPU:             ❌ CUDA (GPU) not available. Using CPU.", 'red', attrs=['bold']))
+
+# Selected Device
+logging.info(f"Selected Device: {device}")
+logging.info("---------------------------------------")
+
 
 # --- Platform-specific imports for enhanced functionality ---
 if sys.platform == "win32":
@@ -223,16 +268,21 @@ class GStreamerPipeline:
 
         pipeline_str = (
             f"fdsrc fd=0 do-timestamp=true is-live=true ! videoparse format=bgr width={self.width} height={self.height} framerate={self.fps}/1 ! "
-            "queue ! videoconvert ! videorate ! "
-            f"video/x-raw,format=NV12 ! " # NV12 is fine for H.264 too
             "queue ! "
-            # This is the H264 line
-            f"nvh264enc preset=low-latency rc-mode=cbr bitrate=4000 gop-size=30 ! " # H.264 typically uses low-latency (no hq)
-            "h264parse ! rtph264pay pt=96 config-interval=1 ! " # IMPORTANT: Change h265parse to h264parse and rtph265pay to rtph264pay
+            "cudaupload ! "
+            "queue ! cudaconvert ! videorate ! "
+            "video/x-raw(memory:CUDAMemory),format=NV12 ! "
+            "queue ! "
+            
+            # --- THE OPTIMIZED ENCODER STRING ---
+            # Using the modern preset/tune config for lowest latency and highest speed
+            f"nvh264enc preset=p1 tune=ultra-low-latency zerolatency=true rc-mode=cbr bitrate=4000 gop-size=30 ! "
+            # ------------------------------------
+
+            "h264parse ! rtph264pay pt=96 config-interval=1 ! "
             f"udpsink host={self.host} port={self.port} sync=false async=false"
         )
         logging.info(f"Attempting to start GStreamer video pipeline ({self.width}x{self.height}@{self.fps}fps) to {self.host}:{self.port}...")
-        
         env_vars = os.environ.copy()
         env_vars['GST_DEBUG'] = '3'
 
@@ -1132,6 +1182,18 @@ if __name__ == "__main__":
             unet_config=UNET_CONFIG_PATH,
             device=device
         )
+        # --- NEW OPTIMIZATION --- 
+        '''
+        logging.info("Applying torch.compile() for maximum performance...")
+        if torch.__version__ >= "2.0":
+            unet.model = torch.compile(unet.model, mode="reduce-overhead")
+            vae.vae = torch.compile(vae.vae, mode="reduce-overhead")
+            pe = torch.compile(pe)
+            logging.info("✅ Models successfully compiled.")
+        else:
+            logging.warning("torch.compile() requires PyTorch 2.0+. Skipping.")
+        '''
+        # ------------------------
         timesteps = torch.tensor([0], device=device) # Initialize global timesteps tensor
         
         pe = pe.half().to(device)

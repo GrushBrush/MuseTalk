@@ -1,7 +1,7 @@
 avatar_2:
  preparation: False
  bbox_shift: 0
- batch_size: 8  
+ batch_size: 16  
  video_path: "data/video/sun.mp4"
  audio_clips:
      audio_0: "data/audio/sun.wav"
