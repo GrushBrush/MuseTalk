@@ -462,6 +462,22 @@ class Avatar:
         self.idx = 0
         
         self.init_avatar_data()
+        # --- NEW OPTIMIZATION: PRE-PROCESSING STEP ---
+        logging.info("Pre-processing avatar data for optimized performance...")
+        
+        # Pre-convert frames from BGR NumPy arrays to RGB PIL Images
+        self.body_pil_cycle = [
+            Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            for frame in self.frame_list_cycle
+        ]
+        
+        # Pre-convert masks to grayscale PIL Images
+        self.mask_pil_cycle = [
+            Image.fromarray(mask).convert("L")
+            for mask in self.mask_list_cycle
+        ]
+        
+        logging.info("✅ Avatar data pre-processing complete.")
         logging.info(f"✅ Avatar '{self.avatar_id}' initialized with {len(self.frame_list_cycle)} reference frames.")
 
     def init_avatar_data(self):
@@ -893,70 +909,66 @@ class Avatar:
         
     def _blend_single_frame(self, res_frame, target_width, target_height):
         """
-        Blends a single generated face frame onto the original background.
-        
-        This is a direct 1:1 implementation of the original MuseTalk library's
-        get_image_blending function, ensuring correct and robust behavior.
+        [OPTIMIZED] Blends a single generated face frame onto the original background.
+        This version uses pre-converted PIL objects to reduce real-time overhead.
         """
         try:
-            # 1. --- Retrieve all necessary data for the current reference frame ---
+            # 1. --- Retrieve pre-processed data for the current frame ---
             cycle_len = len(self.coord_list_cycle)
             if cycle_len == 0:
-                logging.error("Cannot blend frame, avatar cycle data is empty.")
-                return None
+                return None # No need to log error every frame
 
             current_idx = self.idx % cycle_len
 
-            # These are the pre-calculated, full-size components from the preparation step
-            ori_frame = self.frame_list_cycle[current_idx]
+            # Retrieve the pre-calculated and pre-converted PIL images
+            body_pil = self.body_pil_cycle[current_idx]
+            mask_pil = self.mask_pil_cycle[current_idx]
+            
+            # These are still needed from the original lists
             face_bbox = self.coord_list_cycle[current_idx]
-            mask_array = self.mask_list_cycle[current_idx]
             crop_box = self.mask_coords_list_cycle[current_idx]
-            
-            # --- Convert numpy arrays to PIL Images for pasting ---
-            # The library uses PIL for all its blending operations.
-            body_pil = Image.fromarray(ori_frame[:, :, ::-1]) # Convert BGR to RGB for PIL
-            
-            # The `res_frame` is the 256x256 generated face from the VAE
-            # It needs to be resized to the size of the face bbox
+
+            # 2. --- Perform necessary real-time conversions and operations ---
+
+            # Resize the AI-generated face (this must be done in real-time)
             face_w = int(face_bbox[2] - face_bbox[0])
             face_h = int(face_bbox[3] - face_bbox[1])
-            res_frame_resized = cv2.resize(res_frame.astype(np.uint8), (face_w, face_h), interpolation=cv2.INTER_LANCZOS4)
-            face_pil = Image.fromarray(res_frame_resized[:, :, ::-1]) # Convert BGR to RGB for PIL
+            
+            # OPTIMIZATION: Switched to a faster interpolation method.
+            # INTER_LINEAR is a great balance of speed and quality.
+            res_frame_resized = cv2.resize(res_frame.astype(np.uint8), (face_w, face_h), interpolation=cv2.INTER_LINEAR)
+            
+            # This is the only BGR->RGB conversion left in the hot-loop
+            face_pil = Image.fromarray(res_frame_resized[:, :, ::-1])
 
-            # The mask_array from prep is already the correct size for the crop_box
-            mask_pil = Image.fromarray(mask_array).convert("L")
-
-            # 2. --- Replicate the Original Library's Paste Logic ---
-
-            # Get the coordinates for the expanded crop box and the face box
+            # 3. --- Replicate the Original Library's Paste Logic ---
             x_s, y_s, _, _ = [int(p) for p in crop_box]
             x_f, y_f, _, _ = [int(p) for p in face_bbox]
 
-            # Crop the large region from the original frame
+            # This crop operation is faster now as it's on an already-loaded PIL image
             face_large_pil = body_pil.crop(tuple(int(p) for p in crop_box))
 
-            # Paste the generated (resized) face onto this large region at the correct offset
-            # The offset is the face's top-left corner relative to the large crop box's top-left corner
             paste_position = (x_f - x_s, y_f - y_s)
             face_large_pil.paste(face_pil, paste_position)
-
-            # Paste the entire modified region back onto the main frame, using the mask
             body_pil.paste(face_large_pil, (x_s, y_s), mask_pil)
 
-            # 3. --- Convert back to numpy array for sending to GStreamer ---
-            final_frame = np.array(body_pil)[:, :, ::-1] # Convert RGB back to BGR for OpenCV/GStreamer
+            # 4. --- Convert back to numpy for GStreamer ---
+            # This final conversion is unavoidable
+            final_frame = np.array(body_pil, dtype=np.uint8)[:, :, ::-1]
 
-            # 4. --- Increment index and return the final, composited frame ---
+            # 5. --- Increment index and return the final frame ---
             self.idx += 1
             
+            # This final resize for GStreamer is also unavoidable
             if final_frame.shape[0] != target_height or final_frame.shape[1] != target_width:
                  return cv2.resize(final_frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
             else:
                  return final_frame
 
         except Exception as e:
-            logging.error(f"Error blending frame at index {self.idx}: {e}", exc_info=True)
+            # Reduced logging level for performance
+            if self.idx % 100 == 0: # Log only every 100 frames to avoid spam
+                logging.warning(f"Error blending frame at index {self.idx}: {e}")
             self.idx += 1
             return None
 
