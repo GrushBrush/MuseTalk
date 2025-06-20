@@ -36,9 +36,9 @@ gst-launch-1.0 -v `
         ! d3d11videosink sync=true qos=true max-lateness=200000000 `
 `
     udpsrc port=$audioPort caps="application/x-rtp, media=audio, clock-rate=48000, encoding-name=OPUS, payload=97" `
-        ! rtpjitterbuffer latency=350 `
-        ! queue `
+        ! rtpjitterbuffer latency=375 drop-on-latency=true `
         ! rtpopusdepay `
-        ! opusdec `
+        ! opusdec plc=true `
         ! audioconvert `
-        ! wasapisink sync=true qos=true 
+        ! audioresample `
+        ! wasapisink sync=false 
