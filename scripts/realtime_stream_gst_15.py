@@ -911,51 +911,81 @@ class Avatar:
             logging.info(f">>> Inference run '{run_id}' finished in {elapsed:.2f}s. <<<")
 
     def process_and_send_frames(self, vae_to_blend_q, gst_video, gst_audio, total_frames_planned, frame_skip_threshold_val):
-        """Consumer thread: blends generated frames with original background and sends to GStreamer."""
+        """
+        [OPTIMIZED] Consumer thread: blends generated frames, interleaves audio, and sends to GStreamer.
+        This version sends a small audio chunk immediately after its corresponding video frame
+        to ensure smooth audio playback.
+        """
         total_frames_processed = 0
-        while total_frames_processed < total_frames_planned:
-            # --- FRAME SKIPPING LOGIC ---
-            while vae_to_blend_q.qsize() > frame_skip_threshold_val:
-                try:
-                    logging.warning(f"Queue high ({vae_to_blend_q.qsize()}). Skipping a frame batch to catch up.")
-                    skipped_item = vae_to_blend_q.get_nowait()
-                    if skipped_item is not None:
-                        total_frames_processed += len(skipped_item[0]) # Account for skipped frames
-                    vae_to_blend_q.task_done()
-                except queue.Empty:
-                    break # Queue emptied, proceed normally
-            # --- END FRAME SKIPPING ---
+        total_frames_skipped = 0
 
+        # --- DYNAMIC FRAME SKIPPING ---
+        # If the producer gets too far ahead, we skip the oldest entire batches to catch up quickly.
+        while vae_to_blend_q.qsize() > frame_skip_threshold_val:
             try:
-                batch_data = vae_to_blend_q.get(block=True, timeout=10.0) # Block and wait for next item
+                # Get and discard the oldest batch in the queue
+                skipped_item = vae_to_blend_q.get_nowait()
+                if skipped_item and isinstance(skipped_item, tuple) and len(skipped_item[0]) > 0:
+                    num_skipped_in_batch = len(skipped_item[0])
+                    total_frames_skipped += num_skipped_in_batch
+                    total_frames_processed += num_skipped_in_batch # Account for skipped frames in our total
+                    logging.warning(
+                        colored(f"Queue overloaded ({vae_to_blend_q.qsize()}). Skipping a batch of {num_skipped_in_batch} frames to catch up.", 'yellow')
+                    )
+                vae_to_blend_q.task_done()
+            except queue.Empty:
+                break # Queue is empty, nothing more to skip.
+
+        # --- MAIN PROCESSING LOOP ---
+        while total_frames_processed < total_frames_planned:
+            try:
+                # Block and wait for the next batch from the producer
+                batch_data = vae_to_blend_q.get(block=True, timeout=10.0)
             except queue.Empty:
                 logging.error("Timeout waiting for frames from VAE producer. Ending processor thread.")
                 break
 
-            if batch_data is None: # Sentinel value means we're done
+            if batch_data is None: # Sentinel value received, producer is done.
                 logging.info("Received sentinel. Frame processor shutting down.")
                 break
-                
-            vae_frames, audio_chunk = batch_data # Unpack the batch
-            
-            # Process each frame in the batch
-            for frame in vae_frames:
-                blended_frame = self._blend_single_frame(frame, gst_video.width, gst_video.height) # Pass target W/H
+
+            vae_frames, audio_chunk = batch_data
+
+            # --- FRAME-LEVEL A/V INTERLEAVING ---
+            num_frames_in_batch = len(vae_frames)
+            if num_frames_in_batch == 0:
+                vae_to_blend_q.task_done()
+                continue
+
+            samples_per_frame = len(audio_chunk) // num_frames_in_batch
+            audio_cursor = 0
+
+            for i, frame in enumerate(vae_frames):
+                # 1. Blend the video frame
+                blended_frame = self._blend_single_frame(frame, gst_video.width, gst_video.height)
                 if blended_frame is not None:
                     if not gst_video.send_frame(blended_frame):
-                        logging.error("Failed to send video frame to GStreamer. Stopping video sends.")
+                        logging.error("Video pipe broken. Halting all frame processing.")
                         vae_to_blend_q.task_done()
-                        return # Exit thread if video pipe is broken
-            
-            # After sending all video frames for the batch, send the corresponding audio
-            if audio_chunk is not None and audio_chunk.size > 0:
-                if not gst_audio.send_audio(audio_chunk):
-                    logging.error("Failed to send audio chunk to GStreamer.")
+                        return # Exit thread immediately
 
-            total_frames_processed += len(vae_frames)
-            vae_to_blend_q.task_done() # Mark batch as processed
-            
-        logging.info("--- Frame processor finished its work. ---")
+                # 2. Determine the precise audio slice for THIS video frame
+                start_idx = audio_cursor
+                # For the last frame, send all remaining audio to prevent rounding errors
+                end_idx = (audio_cursor + samples_per_frame) if (i < num_frames_in_batch - 1) else len(audio_chunk)
+                audio_slice = audio_chunk[start_idx:end_idx]
+                audio_cursor = end_idx
+
+                # 3. Send the corresponding audio slice
+                if audio_slice.size > 0:
+                    if not gst_audio.send_audio(audio_slice):
+                        # Don't exit the whole thread, just log that audio failed for this chunk
+                        logging.error("Audio pipe broken. Stopping audio sends.")
+
+            total_frames_processed += num_frames_in_batch
+            vae_to_blend_q.task_done()
+
+        logging.info(f"--- Frame processor finished. Processed: {total_frames_processed - total_frames_skipped}, Skipped: {total_frames_skipped} ---")
         
     def _blend_single_frame(self, res_frame, target_width, target_height):
         """
