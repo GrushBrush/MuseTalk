@@ -779,6 +779,28 @@ class Avatar:
             gst_audio_pipeline = GStreamerAudio(sample_rate=48000)
             if not gst_video_pipeline.is_running or not gst_audio_pipeline.is_running: # CHECK is_running flag
                 raise RuntimeError("GStreamer pipeline(s) failed to initialize. Check GStreamer installation and plugins.")
+	    
+	    # --- NEW: PIPELINE WARM-UP / PRE-ROLL ---
+            # This is the critical fix for the initial scrambled/sped-up quarter-second.
+            # We send a few silent, black frames to stabilize the entire pipeline
+            # (Python -> OS buffers -> GStreamer) before the real content starts.
+            logging.info("Warming up streaming pipeline with pre-roll frames...")
+            frame_duration = 1.0 / target_fps
+            
+            # Create a single black frame to reuse.
+            black_frame = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            # Pre-roll for a quarter-second to stabilize the connection.
+            num_preroll_frames = int(target_fps / 4) 
+
+            for _ in range(num_preroll_frames):
+                if not gst_video_pipeline.send_frame(black_frame):
+                    raise RuntimeError("GStreamer video pipe broke during pre-roll.")
+                # We use a simple sleep here for the pre-roll, as precision is less critical
+                # than just giving the pipeline time to initialize.
+                time.sleep(frame_duration)
+            logging.info("Pre-roll complete. Starting main content stream.")
+            # --- END NEW SECTION ---
 
             # 2. Process audio input
             audio_reader = FFmpegAudioReader(audio_source)
