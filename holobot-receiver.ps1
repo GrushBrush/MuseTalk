@@ -41,4 +41,4 @@ gst-launch-1.0 -v `
         ! opusdec plc=true `
         ! audioconvert `
         ! audioresample `
-        ! wasapisink sync=false 
+        ! wasapisink sync=true

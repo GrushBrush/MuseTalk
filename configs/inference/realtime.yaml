@@ -1,8 +1,8 @@
 avatar_3:
  preparation: False
  bbox_shift: 0
- batch_size: 1  
- video_path: "data/video/sun.mp4"
+ batch_size: 16  
+ video_path: "data/video/aiden-glasses-processed.mp4"
  audio_clips:
      audio_0: "data/audio/sun.wav"
      audio_1: "data/audio/yongen.wav"

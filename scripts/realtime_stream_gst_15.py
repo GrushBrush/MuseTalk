@@ -280,7 +280,7 @@ class GStreamerPipeline:
             # ------------------------------------
 
             "h264parse ! rtph264pay pt=96 config-interval=1 ! "
-            f"udpsink host={self.host} port={self.port} sync=false async=false"
+            f"udpsink host={self.host} port={self.port} sync=true async=false"
         )
         logging.info(f"Attempting to start GStreamer video pipeline ({self.width}x{self.height}@{self.fps}fps) to {self.host}:{self.port}...")
         env_vars = os.environ.copy()
@@ -387,7 +387,7 @@ class GStreamerAudio:
             f"audio/x-raw,format=S16LE,channels={self.channels},rate={self.sample_rate},layout=interleaved ! "
             "audioconvert ! audioresample ! "
             "opusenc bitrate=64000 ! rtpopuspay pt=97 ! "
-            f"udpsink host={self.host} port={self.port} sync=false"
+            f"udpsink host={self.host} port={self.port} sync=true"
         )
         logging.info(f"Attempting to start GStreamer audio pipeline ({self.sample_rate}Hz, {self.channels}ch) to {self.host}:{self.port}...")
 
@@ -910,15 +910,19 @@ class Avatar:
             elapsed = time.time() - start_time
             logging.info(f">>> Inference run '{run_id}' finished in {elapsed:.2f}s. <<<")
 
+
+
     def process_and_send_frames(self, vae_to_blend_q, gst_video, gst_audio, total_frames_planned, frame_skip_threshold_val):
         '''
-        [OPTIMIZED] Consumer thread: blends generated frames, interleaves audio, and sends to GStreamer.
+        [ENHANCED VERSION] Consumer thread: blends, paces, interleaves audio, and sends to GStreamer.
 
-        This function is the heart of the real-time playback logic. It performs two critical tasks:
-        1.  **Dynamic Frame Skipping:** If the AI model (producer) generates frames much faster than they can be
+        This function is the heart of the real-time playback logic. It performs three critical tasks:
+        1.  **Real-Time Pacing:** Ensures the stream does not play faster than the target FPS on fast hardware,
+            while having no negative performance impact on slower hardware.
+        2.  **Dynamic Frame Skipping:** If the AI model (producer) generates frames much faster than they can be
             streamed, this function will intelligently drop the oldest batches to "catch up" to real-time,
             preventing runaway latency.
-        2.  **Frame-by-Frame A/V Interleaving:** To ensure smooth audio playback without choppiness, this function
+        3.  **Frame-by-Frame A/V Interleaving:** To ensure smooth audio playback without choppiness, this function
             sends a single video frame and then IMMEDIATELY sends its corresponding small slice of audio.
             This tight interleaving prevents audio buffer underruns on the receiving end.
 
@@ -929,86 +933,93 @@ class Avatar:
             total_frames_planned (int): The total number of frames expected for the entire audio clip.
             frame_skip_threshold_val (int): The queue size at which we start dropping frames to reduce latency.
         '''
+        # --- PACER INITIALIZATION ---
+        target_fps = gst_video.fps
+        frame_duration = 1.0 / target_fps
+        start_time = None  # <<< FIX: Initialize start_time to None.
+        frames_sent = 0
+        # --------------------------
         total_frames_processed = 0
         total_frames_skipped = 0
 
         # --- DYNAMIC FRAME SKIPPING ---
-        # If the producer gets too far ahead, we skip the oldest entire batches to catch up quickly.
-        # This is a "pressure release valve" for the system.
+        # (This section remains unchanged)
         while vae_to_blend_q.qsize() > frame_skip_threshold_val:
             try:
-                # Get and discard the oldest batch in the queue without blocking.
                 skipped_item = vae_to_blend_q.get_nowait()
                 if skipped_item and isinstance(skipped_item, tuple) and len(skipped_item[0]) > 0:
                     num_skipped_in_batch = len(skipped_item[0])
                     total_frames_skipped += num_skipped_in_batch
-                    total_frames_processed += num_skipped_in_batch # Account for skipped frames in our total
+                    total_frames_processed += num_skipped_in_batch
                     logging.warning(
                         colored(f"Queue overloaded ({vae_to_blend_q.qsize()}). Skipping a batch of {num_skipped_in_batch} frames to catch up.", 'yellow')
                     )
                 vae_to_blend_q.task_done()
             except queue.Empty:
-                break # Queue is empty, nothing more to skip.
+                break
 
         # --- MAIN PROCESSING LOOP ---
         while total_frames_processed < total_frames_planned:
             try:
-                # Block and wait for the next batch from the producer (AI model)
-                # A timeout prevents the thread from blocking indefinitely if the producer dies.
                 batch_data = vae_to_blend_q.get(block=True, timeout=10.0)
             except queue.Empty:
                 logging.error("Timeout waiting for frames from VAE producer. Ending processor thread.")
                 break
 
-            # Check for the shutdown signal (sentinel value) from the main thread.
             if batch_data is None:
                 logging.info("Received sentinel. Frame processor shutting down.")
                 break
 
-            vae_frames, audio_chunk = batch_data
+            # <<< FIX: Start the pacer's clock at the exact moment the first batch arrives.
+            if start_time is None:
+                start_time = time.perf_counter()
+                logging.info("First data batch received. Starting real-time pacer clock.")
+            # <<< END FIX
 
-            # --- CORE LOGIC: FRAME-LEVEL A/V INTERLEAVING ---
+            vae_frames, audio_chunk = batch_data
             num_frames_in_batch = len(vae_frames)
             if num_frames_in_batch == 0:
                 vae_to_blend_q.task_done()
                 continue
 
-            # Calculate exactly how many audio samples correspond to a single video frame.
-            # This assumes a constant frame rate.
             samples_per_frame = len(audio_chunk) // num_frames_in_batch
             audio_cursor = 0
 
-            # Iterate through each individual frame within the batch
             for i, frame in enumerate(vae_frames):
+                # --- REAL-TIME PACER ---
+                next_frame_target_time = start_time + (frames_sent + 1) * frame_duration
+                sleep_duration = next_frame_target_time - time.perf_counter()
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+                # --- END PACER ---
+
                 # 1. Blend the generated face onto the background video frame
                 blended_frame = self._blend_single_frame(frame, gst_video.width, gst_video.height)
-                
+
                 if blended_frame is not None:
                     # 2. Send the final video frame to the video pipeline
-                    if not gst_video.send_frame(blended_frame):
+                    if gst_video.send_frame(blended_frame):
+                        frames_sent += 1
+                    else:
                         logging.error("Video pipe broken. Halting all frame processing.")
                         vae_to_blend_q.task_done()
-                        return # Exit the thread immediately to prevent further errors
+                        return
 
                 # 3. Determine the precise audio slice for THIS video frame
                 start_idx = audio_cursor
-                # For the last frame, send all remaining audio to prevent rounding errors and drift
                 end_idx = (audio_cursor + samples_per_frame) if (i < num_frames_in_batch - 1) else len(audio_chunk)
                 audio_slice = audio_chunk[start_idx:end_idx]
                 audio_cursor = end_idx
 
-                # 4. Send the corresponding audio slice IMMEDIATELY after its video frame
+                # 4. Send the corresponding audio slice
                 if audio_slice.size > 0:
                     if not gst_audio.send_audio(audio_slice):
-                        # Don't exit the whole thread, but log that audio failed for this chunk
-                        # and stop trying to send more audio if the pipe is broken.
                         logging.error("Audio pipe broken. Stopping audio sends for this run.")
 
-            # Mark the entire batch as processed
             total_frames_processed += num_frames_in_batch
             vae_to_blend_q.task_done()
 
-        logging.info(colored(f"--- Frame processor finished. Processed: {total_frames_processed - total_frames_skipped}, Skipped: {total_frames_skipped} ---", "green"))
+        logging.info(colored(f"--- Frame processor finished. Sent: {frames_sent}, Skipped: {total_frames_skipped} ---", "green"))
         
     def _blend_single_frame(self, res_frame, target_width, target_height):
         """
