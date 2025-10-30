@@ -40,6 +40,14 @@ logging.info("Environment variables loaded from .env file.")
 
 # GStreamer related paths and parameters
 GSTREAMER_LAUNCH_PATH = os.getenv("GSTREAMER_LAUNCH_PATH", "gst-launch-1.0") # Global path for gst-launch
+# NEW - Add this sanitization immediately after
+if "GSTREAMER_LAUNCH_PATH=" in GSTREAMER_LAUNCH_PATH:
+    # Remove the erroneous key prefix if it exists
+    GSTREAMER_LAUNCH_PATH = GSTREAMER_LAUNCH_PATH.split("GSTREAMER_LAUNCH_PATH=", 1)[-1]
+    logging.warning(f"⚠️  Cleaned malformed GSTREAMER_LAUNCH_PATH value. Now: {GSTREAMER_LAUNCH_PATH}")
+
+# Also add debug logging to see what was actually loaded
+logging.info(f"🔍 Final GSTREAMER_LAUNCH_PATH: '{GSTREAMER_LAUNCH_PATH}'")
 STREAM_PIPE_PATH = os.getenv("STREAM_PIPE_PATH", "./hot_file.opus")
 TARGET_FPS = int(os.getenv("TARGET_FPS", "25")) # Use for general FPS calculations
 FRAME_SKIP_THRESHOLD = int(os.getenv("FRAME_SKIP_THRESHOLD", "3")) # Use for consumer queue management
@@ -131,6 +139,65 @@ else:
 logging.info(f"Selected Device: {device}")
 logging.info("---------------------------------------")
 
+def get_optimal_gstreamer_pipeline(gpu_name, width, height, fps, host, port, bitrate=5000):
+    """
+    Returns the optimal GStreamer pipeline string based on detected GPU.
+    
+    Args:
+        gpu_name (str): Name of the GPU from torch.cuda.get_device_properties()
+        width, height, fps: Video parameters
+        host, port: Streaming destination
+        bitrate: Target bitrate in kbps
+    
+    Returns:
+        str: GStreamer pipeline string optimized for the detected GPU
+    """
+    
+    # Detect RTX 50-series (Blackwell) - these need D3D11 pipeline
+    if "RTX 50" in gpu_name or "5090" in gpu_name or "5080" in gpu_name:
+        logging.info(f"🎮 Detected RTX 50-series GPU ({gpu_name}). Using D3D11 hardware acceleration.")
+        return (
+            f"fdsrc fd=0 do-timestamp=true is-live=true ! "
+            f"videoparse format=bgr width={width} height={height} framerate={fps}/1 ! "
+            "queue max-size-buffers=1 leaky=downstream ! "
+            "videoconvert ! video/x-raw,format=NV12 ! "
+            "d3d11upload ! "
+            "queue max-size-buffers=1 leaky=downstream ! "
+            # FIXED: Use correct mfh264enc properties
+            f"mfh264enc rc-mode=cbr bitrate={bitrate * 1000} low-latency=true max-bitrate={bitrate * 1000} ! "
+            "h264parse ! rtph264pay pt=96 config-interval=1 ! "
+            f"udpsink host={host} port={port} sync=true async=false"
+        )
+
+    
+    # RTX 40-series and earlier - use CUDA pipeline
+    elif "RTX" in gpu_name or "GTX" in gpu_name or "Tesla" in gpu_name or "Quadro" in gpu_name:
+        logging.info(f"🎮 Detected NVIDIA GPU with CUDA support ({gpu_name}). Using CUDA pipeline.")
+        return (
+            f"fds qrc fd=0 do-timestamp=true is-live=true ! "
+            f"videoparse format=bgr width={width} height={height} framerate={fps}/1 ! "
+            "queue max-size-buffers=1 leaky=downstream ! "
+            "cudaupload ! "
+            "queue max-size-buffers=1 leaky=downstream ! cudaconvert ! videorate ! "
+            "video/x-raw(memory:CUDAMemory),format=NV12 ! "
+            "queue max-size-buffers=1 leaky=downstream ! "
+            f"nvh264enc preset=p1 tune=ultra-low-latency zerolatency=true rc-mode=cbr bitrate={bitrate} ! "
+            "h264parse ! rtph264pay pt=96 config-interval=1 ! "
+            f"udpsink host={host} port={port} sync=true async=false"
+        )
+    
+    # Fallback to CPU encoding for unknown/non-NVIDIA GPUs
+    else:
+        logging.warning(f"⚠️ Unknown GPU type ({gpu_name}). Falling back to CPU-based x264 encoding.")
+        return (
+            f"fdsrc fd=0 do-timestamp=true is-live=true ! "
+            f"videoparse format=bgr width={width} height={height} framerate={fps}/1 ! "
+            "queue max-size-buffers=1 leaky=downstream ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000 ! "
+            "h264parse ! rtph264pay pt=96 config-interval=1 ! "
+            f"udpsink host={host} port={port} sync=true async=false"
+        )
 
 # --- Platform-specific imports for enhanced functionality ---
 if sys.platform == "win32":
@@ -264,30 +331,37 @@ class GStreamerPipeline:
         self.process = None
         self.stdout_thread = None
         self.stderr_thread = None
-        self.is_running = False # New flag to track if pipeline is successfully started
+        self.is_running = False
 
-        pipeline_str = (
-            f"fdsrc fd=0 do-timestamp=true is-live=true ! videoparse format=bgr width={self.width} height={self.height} framerate={self.fps}/1 ! "
-            "queue max-size-buffers=1 leaky=downstream ! "
-            "cudaupload ! "
-            "queue max-size-buffers=1 leaky=downstream ! cudaconvert ! videorate ! "
-            "video/x-raw(memory:CUDAMemory),format=NV12 ! "
-            "queue max-size-buffers=1 leaky=downstream ! "
-            
-            # --- THE OPTIMIZED ENCODER STRING ---
-            # Using the modern preset/tune config for lowest latency and highest speed
-            f"nvh264enc preset=p1 tune=ultra-low-latency zerolatency=true rc-mode=cbr bitrate=5000 ! "
-            # ------------------------------------
-
-            "h264parse ! rtph264pay pt=96 config-interval=1 ! "
-            f"udpsink host={self.host} port={self.port} sync=true async=false"
+        # --- DYNAMIC PIPELINE SELECTION ---
+        # Get GPU name from global detection
+        gpu_name = ""
+        if torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(device)
+            except:
+                gpu_name = "Unknown"
+        
+        # Generate optimal pipeline for detected hardware
+        pipeline_str = get_optimal_gstreamer_pipeline(
+            gpu_name=gpu_name,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            host=self.host,
+            port=self.port,
+            bitrate=5000
         )
+        
         logging.info(f"Attempting to start GStreamer video pipeline ({self.width}x{self.height}@{self.fps}fps) to {self.host}:{self.port}...")
         env_vars = os.environ.copy()
-        env_vars['GST_DEBUG'] = '3'
+
+
 
         try:
-            command_to_run = f"{GSTREAMER_LAUNCH_PATH} -v {pipeline_str}"
+            # NEW - FIXED
+            command_to_run = f'"{GSTREAMER_LAUNCH_PATH}" -v {pipeline_str}'
+
             logging.info(f"DEBUG: GStreamer VIDEO command (Popen string): {command_to_run}")
 
             self.process = subprocess.Popen(
@@ -394,10 +468,11 @@ class GStreamerAudio:
         env_vars = os.environ.copy()
         env_vars['GST_DEBUG'] = '3'
         
+        # In GStreamerAudio.__init__(), around line 378:
         try:
-            command_to_run = f"{GSTREAMER_LAUNCH_PATH} -v {pipeline_str}"
+            command_to_run = f'"{GSTREAMER_LAUNCH_PATH}" -v {pipeline_str}'
             logging.debug(f"DEBUG: GStreamer AUDIO command (Popen string): {command_to_run}")
-
+            
             self.process = subprocess.Popen(
                 command_to_run,
                 stdin=subprocess.PIPE,
@@ -406,7 +481,8 @@ class GStreamerAudio:
                 shell=True,
                 bufsize=0,
                 env=env_vars
-            )
+    )
+
             
             if self.process.pid:
                 logging.info(colored(f"✅ GStreamer audio process launched (PID: {self.process.pid}).", 'green', attrs=['bold']))
